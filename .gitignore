@@ -1,0 +1,20 @@
+# Windows
+Thumbs.db
+desktop.ini
+
+# Third-party repo cloned only for reference -- not part of this project
+ERR-MapForGoblins-DLL/
+
+# Build artifacts (each mod also ignores its own; these are safety nets)
+build/
+out/
+.vs/
+*.user
+CMakeSettings.json
+
+# Mod runtime logs
+logs/
+
+# Internal notes / scratch markdown -- keep only README.md files in the repo
+*.md
+!README.md

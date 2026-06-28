@@ -1,0 +1,6 @@
+[submodule "InfiniteWeaponBuffs/external/libER"]
+	path = InfiniteWeaponBuffs/external/libER
+	url = https://github.com/Dasaav-dsv/libER
+[submodule "AdjustableSummonCost/external/libER"]
+	path = AdjustableSummonCost/external/libER
+	url = https://github.com/Dasaav-dsv/libER
