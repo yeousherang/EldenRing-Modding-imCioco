@@ -4,3 +4,6 @@
 [submodule "AdjustableSummonCost/external/libER"]
 	path = AdjustableSummonCost/external/libER
 	url = https://github.com/Dasaav-dsv/libER
+[submodule "PersistentBuffs/external/minhook"]
+	path = PersistentBuffs/external/minhook
+	url = https://github.com/TsudaKageyu/minhook.git
