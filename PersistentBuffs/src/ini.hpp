@@ -44,6 +44,12 @@ public:
         return ki == si->second.end() ? def : ki->second;
     }
 
+    int get_int(const std::string& sec, const std::string& key, int def) const {
+        const std::string v = trim(get_string(sec, key));
+        if (v.empty()) return def;
+        try { return std::stoi(v); } catch (...) { return def; }
+    }
+
     bool get_bool(const std::string& sec, const std::string& key, bool def) const {
         const std::string v = lower(get_string(sec, key));
         if (v.empty()) return def;

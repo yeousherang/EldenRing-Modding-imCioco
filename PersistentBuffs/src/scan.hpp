@@ -80,6 +80,39 @@ inline uintptr_t aob_scan(const Module& m, const std::string& pattern) {
     return 0;
 }
 
+// Like aob_scan, but verifies the pattern is UNIQUE (mirrors CE's
+// AOBScanModuleUnique). Returns the first match and, via `multiple`, whether a
+// second match exists -- a non-unique signature means we may have grabbed the
+// wrong function and the caller should refuse to use it.
+inline uintptr_t aob_scan_unique(const Module& m, const std::string& pattern,
+                                 bool* multiple = nullptr) {
+    if (multiple) *multiple = false;
+    if (!m.base || !m.size) return 0;
+
+    std::vector<int> bytes; // -1 == wildcard
+    std::istringstream ss(pattern);
+    std::string tok;
+    while (ss >> tok) {
+        if (tok == "??" || tok == "?") bytes.push_back(-1);
+        else bytes.push_back(static_cast<int>(std::stoul(tok, nullptr, 16)));
+    }
+    if (bytes.empty()) return 0;
+
+    const auto* data = reinterpret_cast<const uint8_t*>(m.base);
+    const size_t n = bytes.size();
+    uintptr_t first = 0;
+    for (size_t i = 0; i + n <= m.size; ++i) {
+        bool ok = true;
+        for (size_t j = 0; j < n; ++j) {
+            if (bytes[j] != -1 && data[i + j] != bytes[j]) { ok = false; break; }
+        }
+        if (!ok) continue;
+        if (!first) { first = m.base + i; }
+        else { if (multiple) *multiple = true; break; }
+    }
+    return first;
+}
+
 // Resolve a RIP-relative reference (e.g. `lea/mov reg,[rip+disp32]`).
 // `at` points at the start of the instruction; `disp_off` is the byte offset
 // of the disp32 within it; `insn_len` is the instruction length.

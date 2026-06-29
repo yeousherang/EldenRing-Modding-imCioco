@@ -4,10 +4,12 @@ A **runtime** native DLL mod for Elden Ring that keeps your active buffs through
 **fast travel** and **death** — the two transitions where the engine wipes all
 active SpEffects regardless of their duration.
 
-> 🚧 **Work in progress.** This is a scaffold. It currently loads, finds the
-> player, and **logs your active SpEffects** each tick (to verify offsets). The
-> actual re-application of buffs still needs a bit of reverse-engineering to be
-> wired up — see [CLAUDE.md](CLAUDE.md) for the exact remaining steps.
+> ✅ **Working:** buffs persist through **fast travel** and **death**
+> (confirmed in-game). An experimental, opt-in `[weapon_memory]` feature also
+> keeps **weapon buffs (greases / blade spells) through weapon swaps and
+> dual-wielding**. Roadmap: independent fast-travel/death toggles and buff
+> filtering — see [CLAUDE.md](CLAUDE.md). Offsets/signatures are game-version
+> specific; verify via the log if your build differs.
 
 > ⚠️ **Offline only.** Memory-editing/hooking mod — run with EasyAntiCheat
 > disabled (ModEngine3/2, Elden Mod Loader). Online use risks a ban.
@@ -29,6 +31,13 @@ clears them on a transition.
 [persistence]
 keep_after_fast_travel = 1
 keep_after_death       = 1
+
+[weapon_memory]
+; EXPERIMENTAL (default off). Remembers greases/blade buffs per weapon and
+; restores them after a loadout change (swapping weapons, or bringing a left-hand
+; weapon into play / dual-wielding, which vanilla drops the buff on). Body buffs
+; (Golden Vow, consumables) are left alone.
+remember_per_weapon = 0
 ```
 
 ## Build
