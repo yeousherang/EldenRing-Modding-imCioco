@@ -12,6 +12,7 @@ memory at runtime — no `regulation.bin` edits.
 | Mod | What it does |
 |---|---|
 | [InfiniteWeaponBuffs](InfiniteWeaponBuffs/) | Makes every weapon buffable and sets buff durations (greases / spell buffs / consumables), incl. permanent. Optional buff stacking. |
+| [PersistentBuffs](PersistentBuffs/) | Keeps active buffs through **fast travel** and **death** (engine wipes them otherwise) by re-applying them at runtime. Optional per-weapon buff memory across weapon swaps / dual-wielding. |
 | [AdjustableSummonCost](AdjustableSummonCost/) | Adjusts summon (Spirit Ash) costs. |
 
 See each mod's own `README.md` for configuration and install details.
@@ -22,7 +23,7 @@ Prerequisites: Visual Studio 2022 (Desktop C++), CMake ≥ 3.15, Git.
 
 ```sh
 # clone with submodules (libER)
-git clone --recursive https://github.com/<you>/EldenRing_Mods.git
+git clone --recursive https://github.com/imCioco/EldenRing-Modding.git
 # or, if already cloned:
 git submodule update --init --recursive
 ```
