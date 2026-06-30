@@ -1,4 +1,4 @@
-# EldenRing_Mods
+# EldenRing-Modding
 
 A collection of native C++ DLL mods for Elden Ring, built on
 [libER](https://github.com/Dasaav-dsv/libER). Each mod edits param tables in
