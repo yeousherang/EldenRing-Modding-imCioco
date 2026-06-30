@@ -38,6 +38,12 @@ keep_after_death       = 1
 ; weapon into play / dual-wielding, which vanilla drops the buff on). Body buffs
 ; (Golden Vow, consumables) are left alone.
 remember_per_weapon = 0
+
+; AoW SELF-buffs (Endure, Determination, Royal Knight's Resolve, Roars, ...) that
+; should survive ANY weapon swap instead of being tied to the casting weapon.
+; Element weapon-enchants are intentionally excluded. Comma-separated ids; a
+; sensible default is shipped in the .ini. Find ids via the debug log.
+; always_persist_ids = 1650,1691,...
 ```
 
 ## Build

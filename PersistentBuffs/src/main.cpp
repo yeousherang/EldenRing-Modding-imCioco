@@ -44,6 +44,10 @@ bool      g_debug = false;
 // ---- config ------------------------------------------------------------
 bool g_keep_fast_travel = true;
 bool g_keep_death       = true;
+// Diagnostic: log every SpEffect id that appears/disappears on the player (raw,
+// unfiltered). Use it to discover system effect ids -- e.g. walk into Roundtable
+// Hold and see which id the no-combat state adds. Off by default (chatty).
+bool g_log_effects      = false;
 // Wait this long after the player reappears (transition finished) before
 // re-applying, so the world/character is fully settled and the engine has
 // already done its wipe. Avoids re-applying into a half-loaded ChrIns.
@@ -52,6 +56,17 @@ int  g_reapply_delay_ms = 500;
 // on each right-hand weapon, and re-apply them when you swap back to that weapon
 // (vanilla drops them on a weapon swap). Default off. Right-hand only for now.
 bool g_weapon_memory    = false;
+// Buffs to treat as CHARACTER-WIDE rather than weapon-bound: AoW self-buffs
+// (Endure, Determination, Royal Knight's Resolve, Roars, War Cry, Golden Vow...)
+// are stat buffs that merely happen to be cast from a weapon art -- they should
+// survive any weapon swap, not get re-bound to the casting weapon like a grease.
+// (Element weapon-enchants -- Sacred Blade, Chilling Mist, etc. -- are NOT here:
+// those genuinely belong to the weapon.) Seeded from Paramdex; ini-overridable.
+std::unordered_set<int> g_always_persist;
+// Extra SpEffect ids to never persist, on top of the built-in system blocklist
+// (see is_persistable). Lets the user blocklist a stray system/environment effect
+// found via log_effects without a rebuild.
+std::unordered_set<int> g_exclude;
 
 // ============================================================
 //  VERSION-SPECIFIC OFFSETS / SIGNATURES -- VERIFY before trusting!
@@ -152,6 +167,18 @@ void flog(const char* fmt, ...) {
     log_line(buf);
 }
 
+// Parse a list of integer ids from a string (any non-digit is a separator).
+std::unordered_set<int> parse_id_list(const std::string& s) {
+    std::unordered_set<int> out;
+    std::string num;
+    for (char c : s) {
+        if (c >= '0' && c <= '9') { num += c; continue; }
+        if (!num.empty()) { out.insert(std::atoi(num.c_str())); num.clear(); }
+    }
+    if (!num.empty()) out.insert(std::atoi(num.c_str()));
+    return out;
+}
+
 // ---- game access -------------------------------------------------------
 mem::Module g_mod;
 
@@ -215,11 +242,53 @@ void enumerate_speffects(uintptr_t player, std::vector<int>& out) {
     }
 }
 
-// TODO: real filter. For now treat every enumerated effect as persistable.
-// Should exclude debuffs / status build-ups / system effects -- e.g. cross-ref
-// SpEffectParam (effectTargetSelf + finite/positive effectEndurance), or keep a
-// curated allow-list of buff ids. See CLAUDE.md.
-bool is_persistable(int /*sp_effect_id*/) { return true; }
+// Space-separated id list for logging.
+std::string join_ids(const std::vector<int>& ids) {
+    std::string s;
+    for (int id : ids) { s += std::to_string(id); s += ' '; }
+    return s;
+}
+
+// Diagnostic: log which effect ids appeared/disappeared since last call (raw,
+// unfiltered) so system effects can be discovered from the log. No-op unless
+// g_log_effects is on.
+void log_effect_changes(const std::vector<int>& cur_vec) {
+    static std::unordered_set<int> prev;
+    std::unordered_set<int> cur(cur_vec.begin(), cur_vec.end());
+    std::string added, removed;
+    for (int id : cur)  if (!prev.count(id)) { added   += std::to_string(id); added   += ' '; }
+    for (int id : prev) if (!cur.count(id))  { removed += std::to_string(id); removed += ' '; }
+    if (!added.empty() || !removed.empty())
+        flog("effects changed: +[ %s] -[ %s] -> active now [ %s]",
+             added.c_str(), removed.c_str(), join_ids(cur_vec).c_str());
+    prev = std::move(cur);
+}
+
+// Reject engine state / environment effects that the engine applies & clears
+// itself. Re-applying them sticks the player in that state. The headline case
+// (confirmed in-game via log_effects): Roundtable Hold's no-combat block,
+// SpEffect 9621 "Disallow Hostile Actions" -- snapshotted in the Hold and
+// re-applied on the way out, it locks you out of attacks/spells/arts until you
+// restart. Plus the [HKS] animation/state machine block and a couple of
+// environment effects. Ids from soulsmods/Paramdex (ER SpEffectParam names).
+bool is_persistable(int id) {
+    if (g_exclude.count(id))           return false; // user-supplied (ini)
+    if (id >= 100000 && id <= 100999)  return false; // [HKS] state block + grace
+    if (id >= 131    && id <= 147)     return false; // jump / attack anim states
+    if (id >= 170    && id <= 176)     return false; // guard anim states
+    switch (id) {
+        case 45:      // [HKS] Counter Frames
+        case 8001:    // [HKS] Is Stealth
+        case 10665:   // [HKS] Event action not possible
+        case 530007:  // [HKS] Goods stamina cost
+        case 530012:  // [HKS] Goods stamina cost
+        case 9621:    // Disallow Hostile Actions (Roundtable Hold no-combat)
+        case 4600:    // Wet (Rain) -- environment, shouldn't follow you out
+            return false;
+        default:
+            return true;
+    }
+}
 
 void reapply(uintptr_t player, const std::vector<int>& ids) {
     if (!g_apply) { // function not resolved yet -> inert, but log intent
@@ -228,12 +297,14 @@ void reapply(uintptr_t player, const std::vector<int>& ids) {
         return;
     }
     int n = 0;
+    std::string applied;
     for (int id : ids) {
         if (!is_persistable(id)) continue;
         g_apply(reinterpret_cast<void*>(player), id, 1); // unk=1 == "self"
+        applied += std::to_string(id); applied += ' ';
         ++n;
     }
-    flog("reapply: re-applied %d buff(s)", n);
+    flog("reapply: re-applied %d buff(s): [ %s]", n, applied.c_str());
 }
 
 // ---- per-weapon buff memory --------------------------------------------
@@ -258,6 +329,7 @@ constexpr int kReapplyWindowTicks = 3;  // ~600ms at the 200ms poll; covers swap
 std::unordered_map<int,int> g_applied_owner; // buff id -> weapon active when it appeared
 std::unordered_map<int,int> g_buff_owner;    // confirmed weapon-bound buff -> owner weapon
 std::unordered_set<int>     g_prev_buffs;
+std::unordered_set<int>     g_restored_event; // buffs already restored since last change
 int  g_prev_right = -1, g_prev_left = -1, g_prev_arm = -2;
 bool g_loadout_valid = false;
 int  g_ticks_since_change = 1 << 20;
@@ -269,7 +341,10 @@ void weapon_memory_tick(uintptr_t player, const std::vector<int>& current) {
     const int right = get_active_right_weapon_id();
     const int left  = get_active_left_weapon_id();
     const int arm   = get_arm_style();
-    const std::unordered_set<int> cur(current.begin(), current.end());
+    // Only track real buffs -- never engine state effects (so we don't bind/
+    // re-apply Roundtable's no-combat block etc. through weapon swaps).
+    std::unordered_set<int> cur;
+    for (int id : current) if (is_persistable(id)) cur.insert(id);
     const int owner_now = (right > 0) ? right : left;
 
     if (!g_loadout_valid) {
@@ -283,7 +358,7 @@ void weapon_memory_tick(uintptr_t player, const std::vector<int>& current) {
     }
 
     const bool changed = (right != g_prev_right) || (left != g_prev_left) || (arm != g_prev_arm);
-    if (changed) g_ticks_since_change = 0;
+    if (changed) { g_ticks_since_change = 0; g_restored_event.clear(); }
     else if (g_ticks_since_change < (1 << 20)) ++g_ticks_since_change;
     const bool recent = g_ticks_since_change <= kReapplyWindowTicks;
 
@@ -311,16 +386,26 @@ void weapon_memory_tick(uintptr_t player, const std::vector<int>& current) {
         }
     }
 
-    // 3) Within the post-change window, restore confirmed weapon buffs whose owner
-    //    is back in hand but whose effect got dropped. (Owner not in hand => we
-    //    intentionally swapped away => leave it dropped until we return.)
+    // 3) Within the post-change window, restore dropped confirmed buffs. A normal
+    //    weapon buff (grease) is restored only while its owner weapon is back in
+    //    hand (owner not in hand => we swapped away on purpose => leave dropped).
+    //    An "always-persist" buff (AoW self-buff) is restored regardless of which
+    //    weapon is in hand, so it survives any swap like a body buff.
+    //    De-duped per change event: in a dual-wield state the engine may keep our
+    //    re-applied buff under a different id, so it never re-appears in `cur` --
+    //    without this guard we'd re-apply (and log) every tick of the window.
     if (recent && g_apply) {
         int n = 0;
-        for (const auto& kv : g_buff_owner)
-            if ((kv.second == right || kv.second == left) && !cur.count(kv.first)) {
-                g_apply(reinterpret_cast<void*>(player), kv.first, 1);
+        for (const auto& kv : g_buff_owner) {
+            const int id = kv.first, owner = kv.second;
+            const bool in_hand = (owner == right || owner == left);
+            const bool always  = g_always_persist.count(id) != 0;
+            if ((in_hand || always) && !cur.count(id) && !g_restored_event.count(id)) {
+                g_apply(reinterpret_cast<void*>(player), id, 1);
+                g_restored_event.insert(id);
                 ++n;
             }
+        }
         if (n) flog("weapon-memory: restored %d weapon buff(s) after loadout change", n);
     }
 
@@ -380,6 +465,7 @@ DWORD WINAPI run(LPVOID) {
 
         if (player) {
             enumerate_speffects(player, current);
+            if (g_log_effects) log_effect_changes(current);
 
             if (!had_player) {
                 // Just (re)entered a playable state -> a load/fast-travel/respawn
@@ -428,15 +514,27 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         Ini ini;
         const bool loaded = ini.load(config_path());
         g_debug           = ini.get_bool("general", "debug_console", false);
+        g_log_effects     = ini.get_bool("general", "log_effects", false);
         g_keep_fast_travel = ini.get_bool("persistence", "keep_after_fast_travel", true);
         g_keep_death       = ini.get_bool("persistence", "keep_after_death", true);
         g_reapply_delay_ms = ini.get_int("persistence", "reapply_delay_ms", 500);
         g_weapon_memory    = ini.get_bool("weapon_memory", "remember_per_weapon", false);
+        // Default = common AoW self-buffs (Roar, Endure, Barbaric Roar, Determination,
+        // Royal Knight's Resolve, Golden Vow, War Cry, Braggart's Roar, Jellyfish
+        // Shield). Element weapon-enchants are deliberately excluded (stay weapon-bound).
+        static const char* kAlwaysPersistDefault =
+            "841,843,846,848,1586,1588,1650,1651,1655,1656,1681,1683,1686,1688,"
+            "1691,1693,1696,1698,1701,1703,1706,1708,1730,1732,1811,1813,1816,1818,"
+            "1861,1863,1866,1868";
+        g_always_persist = parse_id_list(
+            ini.get_string("weapon_memory", "always_persist_ids", kAlwaysPersistDefault));
+        g_exclude = parse_id_list(ini.get_string("persistence", "exclude_ids", ""));
         if (g_debug) { AllocConsole(); FILE* o=nullptr; freopen_s(&o, "CONOUT$", "w", stdout); }
         flog(loaded ? "config loaded" : "[WARN] .ini not found; using defaults");
         flog("keep_after_fast_travel=%d keep_after_death=%d reapply_delay_ms=%d "
-             "remember_per_weapon=%d",
-             g_keep_fast_travel, g_keep_death, g_reapply_delay_ms, g_weapon_memory);
+             "remember_per_weapon=%d always_persist_ids=%zu exclude_ids=%zu",
+             g_keep_fast_travel, g_keep_death, g_reapply_delay_ms, g_weapon_memory,
+             g_always_persist.size(), g_exclude.size());
 
         // MinHook ready for the transition hooks documented in CLAUDE.md.
         if (MH_Initialize() == MH_OK)
