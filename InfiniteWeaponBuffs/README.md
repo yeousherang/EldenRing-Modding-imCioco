@@ -58,30 +58,45 @@ The `.ini` **must** sit next to the DLL and share its base name (`InfiniteWeapon
 
 ## Configure
 
-Edit `InfiniteWeaponBuffs.ini` (kept next to the DLL, sharing its base name). There are **no ID lists to maintain** — you only set a duration per category:
+Edit `InfiniteWeaponBuffs.ini` (kept next to the DLL, sharing its base name). It's organized as `[general]`, one section per buff category, then `[stacking]` and `[discover]`:
 
 ```ini
+[general]
+all_weapons_buffable = 1
+extra_goods =            ; optional: extra goods ids to treat as buff consumables
+
 [greases]
-duration = infinite      ; seconds, or "infinite" (= permanent)
+enabled  = 1
+duration = 300           ; seconds, or "infinite" (= permanent)
 [spell_buffs]
 duration = infinite
 [consumables]
-duration = 300
+duration = infinite
+[ashes_of_war]
+duration = infinite
+speffect_ids =           ; optional: Ash-of-War buff SpEffect ids (see dump)
 ```
+
+`extra_goods` / `speffect_ids` are precise id allowlists (not category numbers), **unioned with** the built-in defaults — leave them empty unless you need to add something the heuristics miss.
 
 ### How categories are derived
 
-The mod finds the SpEffects for each category automatically from the params, so it stays correct across game patches and alongside other mods:
+Categorization is code-driven from live param fields (no `goodsType` lists to maintain), so it stays correct across game patches and alongside other mods:
 
-- **Greases** = SpEffects referenced by `EquipParamGoods` rows of `goodsType 10`.
-- **Consumables** = SpEffects referenced by `EquipParamGoods` of `goodsType 0` and `3` (normal consumables + physick tears).
+- **Greases** = goods that enchant a weapon/shield (`EquipParamGoods.isEnhance` / `isShieldEnchant`) or sit in sort group `70`.
+- **Consumables** = buff/heal goods (`sortGroupId == 20`: Exalted Flesh, cured meats, livers, boluses…) plus an explicit `extra_goods` allowlist. The default allowlist already includes the DLC **Golden Vow** pot (`2003170`), which delivers its buff through a thrown bullet rather than a plain refId.
 - **Spell buffs** = SpEffects referenced by the `Magic` param.
+- **Ashes of War** = an allowlist of weapon-skill self-buff SpEffect ids (built-in defaults + `[ashes_of_war] speffect_ids`). An activated skill's buff is applied through a behavior that can't be reached from the gem param, so a curated id list (the same one PersistentBuffs uses, from soulsmods/Paramdex) drives it. The defaults cover the common self-buff arts — Roar, Endure, Barbaric Roar, Determination, Royal Knight's Resolve, Golden Vow, War Cry, Braggart's Roar, Jellyfish Shield. Element weapon-enchant arts (Cragblade, infusions) are excluded by default — like greases they belong to the weapon, not the character — but you can add any id via `speffect_ids`.
 
-A refId only counts if it's a real `SpEffectParam` row, and with `only_timed_effects = 1` (in `[advanced]`) only effects already on a finite timer are changed — so instant heals, passives and already-permanent buffs are left alone.
+Allowlisted ids are applied directly (the curated list is trusted, so the self/stat field checks are skipped — those misread these effects on some game versions); only the id's own finite timer is required. **Engine system effects are always excluded** by an id blocklist (e.g. `9621` Roundtable "no-combat", animation/grace states, `4600` Wet), independent of struct fields, so they can never be made permanent.
 
-> **Note on debuffs:** the effects come from `Magic.refId` / `Goods.refId`, which are the *self-applied* effects of the spell/item; enemy debuffs are delivered via Bullets, which this mod never touches. SpEffect target flags (`effectTargetSelf/Enemy/...`) are permissive capability flags, *not* a buff-vs-debuff label, so they can't be used to filter debuffs out.
+For each consumable the buff SpEffect is found by following the item's refId (as a SpEffect, or — for thrown pots — as a `Bullet`), its `behavior → bullet` chain, and the SpEffect `replace`/`cycle` chain, then keeping only effects that are **on a finite timer**, **self/player-targeted**, and an **actual stat buff** (see below) — so instant heals, passives, already-permanent buffs, enemy debuffs, *self* debuffs and system/state effects are all left alone. This replaces the old `only_timed_effects` switch (it's now always on, by construction).
 
-> **Scope note:** "spell buffs" and "consumables" are broad — they cover *all* timed buff effects those sources apply, not only weapon-enchant spells / stat-buff foods.
+**Debuffs and system effects are excluded.** A consumable or Ash-of-War effect is only extended if it improves at least one combat/vitality stat (attack, defense, damage negation, max HP/FP/stamina, regen, status resistance, rune gain). This drops both **debuffs** (effects that only worsen stats) and **state effects with no stat change** — e.g. the Roundtable Hold "no-combat" zone state, which must not be made permanent or you'd be unable to attack anywhere. Greases and spell buffs come from trusted, narrow sources and skip this filter.
+
+**Torrent is protected:** every SpEffect reachable from a horse-summon item (`isSummonHorse`, plus the built-in Spectral Steed Whistle id `130`) is fenced off and never patched, so Torrent's "active" state can't get stuck.
+
+> **Scope note:** "spell buffs" and "consumables" are broad — they cover *all* timed self buffs those sources apply, not only weapon-enchant spells / stat-buff foods.
 
 ### Experimental: stacking
 
@@ -89,14 +104,14 @@ One optional extra (**default off**). Only touches the buffs this mod already ma
 
 ```ini
 [stacking]
-no_overwrite = 0     ; let buffs coexist instead of replacing each other
+stacking_bonuses = 0     ; let buffs coexist instead of replacing each other
 ```
 
-- **`no_overwrite`** zeroes `SpEffectParam.spCategory`, removing the mutual-exclusion that makes some buffs replace one another — so you can stack buffs that normally can't coexist.
+- **`stacking_bonuses`** zeroes `SpEffectParam.spCategory`, removing the mutual-exclusion that makes some buffs replace one another — so you can stack buffs that normally can't coexist.
 
 ### Diagnostic dump
 
-Set `dump = 1` under `[discover]` to log every goods/magic → SpEffect reference (and change nothing) — handy if a patch shifts the `goodsType` numbers. Set `debug_console = 1` to also mirror the log to a console window.
+Set `dump = 1` under `[discover]` to log how each category resolves (greases, consumables, spell buffs), which SpEffects are protected as horse-summons, a **potential-misses** list of uncategorized goods that still reach a self timed buff, and an **ash-of-war allowlist check** (which of your `[ashes_of_war]` ids exist and will be extended on this game version) — and change nothing. `debug_console = 1` (also under `[discover]`) mirrors the log to a console window.
 
 ---
 
