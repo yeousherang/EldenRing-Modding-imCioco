@@ -4,6 +4,7 @@ A native C++ DLL mod for Elden Ring that:
 
 1. **Makes every weapon buffable** — any grease or spell buff can be applied to any weapon.
 2. **Sets buff durations** — greases, spell buffs and consumable buffs last as long as you configure (including permanent), per category, via `InfiniteWeaponBuffs.ini`.
+3. **Mirrors weapon buffs to both hands** (optional) — when dual-wielding, a grease or weapon-skill enchant applied to your main hand also lands on the off-hand weapon.
 
 It does this entirely by **rewriting param tables in memory at runtime** (via [libER](https://github.com/Dasaav-dsv/libER)). **No `regulation.bin` edit is involved.**
 
@@ -17,6 +18,7 @@ It does this entirely by **rewriting param tables in memory at runtime** (via [l
 |---|---|
 | All weapons buffable | `EquipParamWeapon.isEnhance = true` on every row |
 | Buff durations | `SpEffectParam.effectEndurance` on the IDs you list (`-1` = permanent, else seconds) |
+| Dual-wield mirror (opt-in) | `SpEffectParam.cycleOccurrenceSpEffectId` on each buff's Right (main-hand) effect → its Left (off-hand) effect |
 
 Edits are applied once, on a worker thread, right after `SoloParamRepository::wait_for_params()` reports the param tables are loaded. They persist for the rest of the session.
 
@@ -58,7 +60,7 @@ The `.ini` **must** sit next to the DLL and share its base name (`InfiniteWeapon
 
 ## Configure
 
-Edit `InfiniteWeaponBuffs.ini` (kept next to the DLL, sharing its base name). It's organized as `[general]`, one section per buff category, then `[stacking]` and `[discover]`:
+Edit `InfiniteWeaponBuffs.ini` (kept next to the DLL, sharing its base name). It's organized as `[general]`, one section per buff category, then `[stacking]`, `[dual_wield]` and `[discover]`:
 
 ```ini
 [general]
@@ -108,6 +110,29 @@ stacking_bonuses = 0     ; let buffs coexist instead of replacing each other
 ```
 
 - **`stacking_bonuses`** zeroes `SpEffectParam.spCategory`, removing the mutual-exclusion that makes some buffs replace one another — so you can stack buffs that normally can't coexist.
+
+### Experimental: dual-wield off-hand mirror
+
+One optional extra (**default off**). When you're dual-wielding and apply a buff to your main hand, this also enchants the **off-hand** weapon. It's a plain param edit — **test in-game**.
+
+```ini
+[dual_wield]
+mirror_to_offhand = 0    ; apply weapon buffs to BOTH hands when dual-wielding
+extra_pairs =            ; optional extra right:left SpEffect id pairs (e.g. mods)
+```
+
+**How it works.** Every weapon buff exists as two `SpEffectParam` rows — a *Right* (`wepParamChange=1`, main hand) and a *Left* (`wepParamChange=2`, off hand). The engine normally applies only the main-hand one. With `mirror_to_offhand = 1`, each buff's Right effect gets `cycleOccurrenceSpEffectId` pointed at its Left effect, so while the main-hand buff is active the engine re-applies the off-hand enchant every cycle — the off-hand weapon gets the full enchant (element + visual + on-hit status proc). Direction is **main-hand → off-hand** only (the hand the game buffs by default); the off-hand inherits the main hand's configured duration.
+
+**What's covered:**
+
+- **Greases** (all vanilla + DLC) — discovered the same way as the duration feature (`is_grease`), so the set stays correct across patches and even covers greases added by other mods. The Right/Left partner is matched by the shared weapon-enchant id (`SpEffectVfxParam.soulParamIdForWepEnchant`), with the variant disambiguated by duration (so e.g. full Fire Grease pairs with full, Drawstring with Drawstring).
+- **Weapon-skill (Ash of War) enchants** — Cragblade, Chilling/Poison Mist, Seppuku, Ice Lightning Sword, Flame Skewer/Spear, Moonlight Greatsword, Ruinous Ghostflame, Sacred Blade, Lightning Slash, Flaming Strike. These aren't items, so they use a built-in id pair list; add more with `extra_pairs` (format `right:left, right:left`).
+
+**Not covered — pure spell enchants.** Scholar's Armament, Black Flame Blade, Bloodflame Blade, Order's Blade, Electrify Armament and Poison Armament have **no off-hand effect row in vanilla**. Mirroring them would require *creating* new param rows, which this mod can't do (it edits params in memory at runtime; libER has no way to add rows to a param table). They stay on the main hand only. *(The reference regulation.bin mod that inspired this added those rows offline — not possible without a `regulation.bin` edit.)*
+
+**Duration note.** The off-hand is refreshed by the main hand's cycle, so with finite durations the off-hand can linger up to its own duration after the main-hand buff ends. With the mod's usual `infinite` durations both hands match exactly — recommended.
+
+> **Tip:** turn on `[discover] dump = 1` together with this and check the **`DUAL-WIELD PAIRS`** section in the log first — it lists every Right→Left pair that would be wired (and flags any main-hand effect whose `cycleOccurrenceSpEffectId` isn't empty), so you can verify coverage before committing.
 
 ### Diagnostic dump
 

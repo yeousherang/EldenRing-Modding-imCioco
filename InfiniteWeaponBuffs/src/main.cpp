@@ -88,6 +88,31 @@ const std::vector<int> kAshOfWarBuffSpEffectsBuiltin = {
     1861, 1863, 1866, 1868,       // Braggart's Roar
 };
 
+// ---- dual-wield off-hand mirror: weapon-art enchant pairs ----
+// A weapon buff is two SpEffect rows: Right (wepParamChange==1) enchants the
+// right weapon, Left (==2) the left. Greases are paired dynamically from the
+// live params (see build_dualwield_mirror); weapon-skill (Ash of War) enchants
+// aren't goods, so their Right->Left pairs are listed here (ids from the
+// soulsmods/Paramdex-based reference set). Extend via [dual_wield] extra_pairs.
+// NB: these are hand-targeted *weapon enchant* arts -- a different set from
+// kAshOfWarBuffSpEffectsBuiltin above, which are character self-buffs (Roar,
+// Determination, ...) that don't target a hand and need no mirroring.
+struct HandPair { int right; int left; };
+const HandPair kDualWieldArtPairsBuiltin[] = {
+    { 821, 823 },              // Sacred Blade
+    { 826, 828 },              // Chilling Mist
+    { 831, 833 },              // Poison Mist
+    { 1676, 1678 },            // Lightning Slash
+    { 1721, 1723 },            // Moonlight Greatsword
+    { 1755, 1758 },            // Seppuku
+    { 1776, 1778 },            // Flaming Strike
+    { 1806, 1808 },            // Ruinous Ghostflame
+    { 1821, 1823 },            // Cragblade
+    { 1891, 1893 },            // Ice Lightning Sword
+    { 20000891, 20000896 },    // Flame Skewer
+    { 20000961, 20000966 },    // Flame Spear
+};
+
 // Sort groups (EquipParamGoods.sortGroupId) we treat as categories.
 constexpr int kSortGroupGrease     = 70; // greases (vanilla + DLC)
 constexpr int kSortGroupConsumable = 20; // buff/heal foods, livers, boluses...
@@ -159,6 +184,21 @@ void parse_int_list(const std::string& spec, std::unordered_set<int>& out) {
         const size_t b = tok.find_last_not_of(" \t");
         try { out.insert(std::stoi(tok.substr(a, b - a + 1))); }
         catch (...) {}
+    }
+}
+
+// ---- parse "821:823, 1821:1823" into right:left pairs -------
+void parse_pair_list(const std::string& spec, std::vector<HandPair>& out) {
+    std::stringstream ss(spec);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        const size_t colon = tok.find(':');
+        if (colon == std::string::npos) continue;
+        try {
+            const int r = std::stoi(tok.substr(0, colon));
+            const int l = std::stoi(tok.substr(colon + 1));
+            out.push_back({ r, l });
+        } catch (...) {}
     }
 }
 
@@ -382,10 +422,113 @@ void gather_magic_entries(const from::paramdef::MAGIC_PARAM_ST& row,
     for (int r : refs) if (r >= 0) out.push_back(r);
 }
 
+// ---- dual-wield off-hand mirroring --------------------------
+// Weapon buffs come as a Right (wepParamChange==1) + Left (==2) SpEffect; the
+// Left enchants the off-hand weapon. Setting Right.cycleOccurrenceSpEffectId =
+// Left makes the engine re-apply the Left every cycle while the main-hand buff is
+// active, so a single buff lands on BOTH weapons when dual-wielding.
+
+// The weapon-enchant id behind a SpEffect (via its vfx -> SpEffectVfxParam), or
+// -1 if it carries no weapon enchant. Right and Left share this per element, so
+// it pairs them (e.g. 1=magic, 3=lightning, 5=poison, 10=holy, 17=black flame).
+int sp_enchant_id(int spId) {
+    auto* r = sp_row(spId);
+    if (!r || r->vfxId < 0) return -1;
+    auto [v, ok] = from::param::SpEffectVfxParam[r->vfxId];
+    if (!ok) return -1;
+    const int e = v.soulParamIdForWepEnchant;        // unsigned char (0/255 = none)
+    return (e > 0 && e < 255) ? e : -1;
+}
+
+float sp_endurance(int spId) {
+    auto* r = sp_row(spId);
+    return r ? r->effectEndurance : 0.0f;
+}
+
+// Build the right->left mirror map. Greases are discovered dynamically (the same
+// is_grease() set the duration pass uses); weapon-art enchants come from the
+// explicit pair list (built-in + .ini extra_pairs). Pairs touching a
+// protected/system effect are skipped. With logDetail, each decision is logged
+// (dump mode) and the resulting map can be discarded.
+void build_dualwield_mirror(const std::vector<HandPair>& artPairs,
+                            const std::unordered_set<int>& protectedSp,
+                            std::unordered_map<int, int>& mirror,
+                            bool logDetail = false) {
+    // Index every Left (wepParamChange==2) enchant effect by its enchant id, so a
+    // grease Right whose Left isn't in its own refs can still find a partner.
+    std::unordered_map<int, std::vector<int>> leftByEnchant;
+    for (auto [id, row] : from::param::SpEffectParam) {
+        if (row.wepParamChange != 2) continue;
+        const int e = sp_enchant_id(static_cast<int>(id));
+        if (e >= 0) leftByEnchant[e].push_back(static_cast<int>(id));
+    }
+
+    // Nearest-(vanilla)-duration Left sharing the Right's enchant id -- this
+    // disambiguates the full vs. drawstring variants, which share an element id
+    // but differ in duration (60s vs 11s, etc.).
+    auto find_left = [&](int rightId) -> int {
+        const int e = sp_enchant_id(rightId);
+        if (e < 0) return -1;
+        const auto it = leftByEnchant.find(e);
+        if (it == leftByEnchant.end()) return -1;
+        const float rd = sp_endurance(rightId);
+        int best = -1;
+        float bestDiff = 1e30f;
+        for (int lid : it->second) {
+            const float ld = sp_endurance(lid);
+            const float diff = ld > rd ? ld - rd : rd - ld;
+            if (diff < bestDiff) { bestDiff = diff; best = lid; }
+        }
+        return best;
+    };
+
+    auto try_add = [&](int r, int l, const char* src) {
+        if (r < 0 || l < 0 || r == l || !sp_row(r) || !sp_row(l)) return;
+        if (protectedSp.count(r) || protectedSp.count(l)) return;
+        if (is_system_effect(r) || is_system_effect(l)) return;
+        const bool added = mirror.emplace(r, l).second;
+        if (logDetail)
+            flog("dual pair %-12s right=%d -> left=%d (enchant=%d, curCyc=%d)%s",
+                 src, r, l, sp_enchant_id(r), sp_row(r)->cycleOccurrenceSpEffectId,
+                 added ? "" : " [dup, kept first]");
+    };
+
+    // Greases: reuse is_grease discovery; pair each Right to a Left.
+    for (auto [id, row] : from::param::EquipParamGoods) {
+        if (!is_grease(row)) continue;
+        const int refs[2] = { row.refId_default, row.refId_1 };
+        std::vector<int> rights, lefts;
+        for (int rf : refs) {
+            auto* sr = sp_row(rf);
+            if (!sr || sr->effectEndurance <= 0.0f) continue;
+            if (sr->wepParamChange == 1)      rights.push_back(rf);
+            else if (sr->wepParamChange == 2) lefts.push_back(rf);
+        }
+        for (int rg : rights) {
+            int lf = -1;
+            const char* src = "grease/goods";
+            const int e = sp_enchant_id(rg);             // primary: Left in same goods
+            for (int c : lefts) if (sp_enchant_id(c) == e) { lf = c; break; }
+            if (lf < 0) { lf = find_left(rg); src = "grease/sig"; } // fallback: index
+            if (lf < 0) {
+                if (logDetail)
+                    flog("dual MISS  grease goods=%d right=%d (no left, enchant=%d)",
+                         static_cast<int>(id), rg, e);
+                continue;
+            }
+            try_add(rg, lf, src);
+        }
+    }
+
+    // Weapon-skill enchants: explicit pairs (built-in + .ini extra_pairs).
+    for (const auto& p : artPairs) try_add(p.right, p.left, "art");
+}
+
 // ---- the param passes ---------------------------------------
 void apply(const Ini& ini, const std::unordered_set<int>& extraGoods,
            const std::unordered_set<int>& horseGoods,
-           const std::unordered_set<int>& ashIds) {
+           const std::unordered_set<int>& ashIds,
+           const std::vector<HandPair>& artPairs) {
     // Pass 1: make every weapon buffable.
     if (ini.get_bool("general", "all_weapons_buffable", true)) {
         int n = 0;
@@ -470,31 +613,59 @@ void apply(const Ini& ini, const std::unordered_set<int>& extraGoods,
              added, d, static_cast<int>(ashIds.size()));
     }
 
-    if (target.empty()) {
+    // Decide the dual-wield pairs BEFORE rewriting durations: the off-hand match
+    // disambiguates full vs. drawstring variants by nearest duration, which must
+    // be read while the rows still hold their vanilla effectEndurance.
+    const bool mirrorOn = ini.get_bool("dual_wield", "mirror_to_offhand", false);
+    std::unordered_map<int, int> mirror;
+    if (mirrorOn) build_dualwield_mirror(artPairs, protectedSp, mirror);
+
+    // Apply durations. `target` already excludes protected/non-timed effects, so
+    // every entry here is a buff we mean to change.
+    if (!target.empty()) {
+        int patched = 0;
+        for (auto [id, row] : from::param::SpEffectParam) {
+            const auto it = target.find(static_cast<int>(id));
+            if (it == target.end()) continue;
+            row.effectEndurance = it->second;
+            if (stackingBonuses) row.spCategory = 0;
+            ++patched;
+        }
+        flog("durations: patched %d SpEffect(s)", patched);
+        if (stackingBonuses)
+            flog("stacking: stacking_bonuses ON -- spCategory zeroed on patched buffs (no mutual exclusion)");
+    } else {
         flog("durations: nothing to do (all categories disabled)");
-        return;
     }
 
-    // Apply. `target` already excludes protected/non-timed effects, so every
-    // entry here is a buff we mean to change.
-    int patched = 0;
-    for (auto [id, row] : from::param::SpEffectParam) {
-        const auto it = target.find(static_cast<int>(id));
-        if (it == target.end()) continue;
-        row.effectEndurance = it->second;
-        if (stackingBonuses) row.spCategory = 0;
-        ++patched;
+    // Dual-wield: wire the off-hand mirror. Done after durations are final so the
+    // off-hand inherits the main hand's configured duration. Opt-in.
+    if (mirrorOn) {
+        int wired = 0;
+        for (const auto& [r, l] : mirror) {
+            auto* rr = sp_row(r);
+            auto* ll = sp_row(l);
+            if (!rr || !ll) continue;
+            rr->cycleOccurrenceSpEffectId = l;   // main-hand active -> off-hand each cycle
+            // Keep the off-hand lasting at least as long as the main hand; never
+            // shrink an off-hand that's already longer or already infinite.
+            if (rr->effectEndurance < 0.0f)
+                ll->effectEndurance = -1.0f;
+            else if (ll->effectEndurance >= 0.0f &&
+                     rr->effectEndurance > ll->effectEndurance)
+                ll->effectEndurance = rr->effectEndurance;
+            ++wired;
+        }
+        flog("dual_wield: wired %d offhand mirror(s) (right->left)", wired);
     }
-    flog("durations: patched %d SpEffect(s)", patched);
-    if (stackingBonuses)
-        flog("stacking: stacking_bonuses ON -- spCategory zeroed on patched buffs (no mutual exclusion)");
 }
 
 // ---- discovery: dump how each category resolves, so coverage can be
 //      verified against the live regulation. Nothing is patched here.
 void dump_candidates(const std::unordered_set<int>& extraGoods,
                      const std::unordered_set<int>& horseGoods,
-                     const std::unordered_set<int>& ashIds) {
+                     const std::unordered_set<int>& ashIds,
+                     const std::vector<HandPair>& artPairs) {
     flog("discover: tgt flags: S=self P=player (only self/player buffs are kept for consumables)");
 
     // --- protected (horse-summon) effects -------------------
@@ -651,6 +822,17 @@ void dump_candidates(const std::unordered_set<int>& extraGoods,
         if (willExtend) ++aok;
     }
     flog("discover: %d/%zu ash allowlist id(s) will be extended", aok, ashIds.size());
+
+    // --- dual-wield off-hand mirror -------------------------
+    // What [dual_wield] mirror_to_offhand=1 would wire: each grease/weapon-art
+    // Right -> its Left (off-hand) enchant. "curCyc" is the right row's current
+    // cycleOccurrenceSpEffectId -- if it's not -1, a vanilla periodic effect
+    // would be overwritten (review before enabling).
+    flog("discover: ---- DUAL-WIELD PAIRS (right -> left offhand mirror) ----");
+    std::unordered_map<int, int> dwMirror;
+    build_dualwield_mirror(artPairs, protectedSp, dwMirror, /*logDetail*/ true);
+    flog("discover: %zu dual-wield mirror pair(s) would be wired", dwMirror.size());
+
     flog("discover: review the sections above, then set dump=0");
 }
 
@@ -680,15 +862,21 @@ DWORD WINAPI run(LPVOID) {
     parse_int_list(ini.get_string("general", "extra_goods", ""), extraGoods);
     parse_int_list(ini.get_string("ashes_of_war", "speffect_ids", ""), ashIds);
 
+    // Dual-wield off-hand mirror: built-in weapon-art pairs + .ini extra_pairs.
+    // (Greases are paired dynamically at apply time, so none are listed here.)
+    std::vector<HandPair> artPairs;
+    for (const auto& p : kDualWieldArtPairsBuiltin) artPairs.push_back(p);
+    parse_pair_list(ini.get_string("dual_wield", "extra_pairs", ""), artPairs);
+
     try {
         flog("waiting for params...");
         from::CS::SoloParamRepository::wait_for_params(-1);
         flog("params ready -- applying edits");
         if (ini.get_bool("discover", "dump", false)) {
             flog("DISCOVER MODE ON -- dumping candidates (durations not applied)");
-            dump_candidates(extraGoods, horseGoods, ashIds);
+            dump_candidates(extraGoods, horseGoods, ashIds, artPairs);
         }
-        apply(ini, extraGoods, horseGoods, ashIds);
+        apply(ini, extraGoods, horseGoods, ashIds, artPairs);
         flog("done.");
     } catch (const std::exception& e) {
         flog("[ERROR] exception: %s", e.what());
