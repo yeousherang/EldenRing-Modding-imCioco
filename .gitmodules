@@ -7,3 +7,6 @@
 [submodule "PersistentBuffs/external/minhook"]
 	path = PersistentBuffs/external/minhook
 	url = https://github.com/TsudaKageyu/minhook.git
+[submodule "PersistentBuffs/external/libER"]
+	path = PersistentBuffs/external/libER
+	url = https://github.com/Dasaav-dsv/libER
