@@ -5,11 +5,14 @@ A **runtime** native DLL mod for Elden Ring that keeps your active buffs through
 active SpEffects regardless of their duration.
 
 > ✅ **Working:** buffs persist through **fast travel** and **death**
-> (confirmed in-game). An experimental, opt-in `[weapon_memory]` feature also
-> keeps **weapon buffs (greases / blade spells) through weapon swaps and
-> dual-wielding**. Roadmap: independent fast-travel/death toggles and buff
-> filtering — see [CLAUDE.md](CLAUDE.md). Offsets/signatures are game-version
-> specific; verify via the log if your build differs.
+> (confirmed in-game). System/state effects (Roundtable Hold's no-combat block,
+> evergaols, …) are **filtered out** so they can't follow you out and lock you
+> out of attacks or Torrent — only genuine stat buffs are re-applied. An
+> experimental, opt-in `[weapon_memory]` feature also keeps **weapon buffs
+> (greases / blade spells) through weapon swaps and dual-wielding**. Roadmap:
+> independent fast-travel/death toggles — see [CLAUDE.md](CLAUDE.md).
+> Offsets/signatures are game-version specific; verify via the log if your build
+> differs.
 
 > ⚠️ **Offline only.** Memory-editing/hooking mod — run with EasyAntiCheat
 > disabled (ModEngine3/2, Elden Mod Loader). Online use risks a ban.
@@ -32,26 +35,32 @@ clears them on a transition.
 keep_after_fast_travel = 1
 keep_after_death       = 1
 
-[weapon_memory]
-; EXPERIMENTAL (default off). Remembers greases/blade buffs per weapon and
-; restores them after a loadout change (swapping weapons, or bringing a left-hand
-; weapon into play / dual-wielding, which vanilla drops the buff on). Body buffs
-; (Golden Vow, consumables) are left alone.
-remember_per_weapon = 0
+; Only genuine stat buffs are persisted; system/state effects are auto-filtered.
+; force_persist_ids = ids to ALWAYS persist (rescue a real buff the filter drops
+; by mistake). Comma-separated; find the id in the log with log_effects = 1.
+force_persist_ids =
 
-; AoW SELF-buffs (Endure, Determination, Royal Knight's Resolve, Roars, ...) that
-; should survive ANY weapon swap instead of being tied to the casting weapon.
-; Element weapon-enchants are intentionally excluded. Comma-separated ids; a
-; sensible default is shipped in the .ini. Find ids via the debug log.
-; always_persist_ids = 1650,1691,...
+[weapon_memory]
+; EXPERIMENTAL. Remembers greases/blade buffs per weapon and restores them after
+; a loadout change (swapping weapons, or bringing a left-hand weapon into play /
+; dual-wielding, which vanilla drops the buff on). Body buffs (Golden Vow,
+; consumables) are left alone.
+remember_per_weapon = 1
 ```
+
+The AoW self-buff list (Endure, Determination, Roars, …) and the re-apply delay
+are now **hard-coded** in `src/main.cpp` (no longer `.ini` options).
+
+**Readable logs (optional):** drop a Paramdex `SpEffectParam.txt` (id → name list,
+from soulsmods/Paramdex) next to the DLL and the log prints `id:Name` instead of
+bare ids.
 
 ## Build
 
 Prerequisites: Visual Studio 2022 (Desktop C++), CMake ≥ 3.15, Git.
 
 ```sh
-git submodule update --init --recursive   # pulls MinHook
+git submodule update --init --recursive   # pulls MinHook + libER
 ```
 
 Then run `build.bat`, or:
@@ -61,7 +70,9 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-Output: `build/Release/PersistentBuffs.dll` (links MinHook statically).
+Output: `build/Release/PersistentBuffs.dll` (links MinHook + libER statically — no
+extra DLLs to ship). libER is used only to read `SpEffectParam` for the buff
+filter.
 
 ## Logs
 
