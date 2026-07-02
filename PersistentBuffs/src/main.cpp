@@ -368,6 +368,19 @@ bool is_system_effect(int id) {
     // spawns until restart. The 202xxxxx range is spirit summons; consumable item
     // buffs we DO want live in 205xxxxx, so this range is safe. Confirmed in-game.
     if (id >= 20200000 && id <= 20299999) return true; // spirit ash summon state
+    // Negative status ailments (Hemorrhage/Poison/Scarlet Rot/Frostbite/Madness/
+    // Sleep/Blight) -- their proc/DoT SpEffects. NEVER persist these: re-applying
+    // one after respawn re-inflicts the ailment. The headline case (Nexus bug
+    // report): DEATH BLIGHT instantly kills, and re-applying it on respawn caused
+    // an inescapable death loop (only removable by quitting + deleting the mod).
+    // The allowlist should already drop debuffs, but block them by id as a hard,
+    // drift-proof safety net. Ranges/ids from soulsmods/Paramdex (ER SpEffectParam):
+    //   70          "Blight Effect"
+    //   500-507     status build-up / behavior states (Cycled/Presence of/Behavior)
+    //   6400-6805   ailment proc effects ("<Ailment> - Type N - Special M")
+    if (id == 70)                       return true; // Blight Effect
+    if (id >= 500  && id <= 507)        return true; // status build-up states
+    if (id >= 6400 && id <= 6810)       return true; // ailment procs (incl. death blight)
     switch (id) {
         case 45:      // [HKS] Counter Frames
         case 514:     // evargaol
@@ -790,9 +803,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
              g_keep_fast_travel, g_keep_death, kReapplyDelayMs, g_weapon_memory,
              g_always_persist.size(), g_force_persist.size());
 
-        // MinHook ready for the transition hooks documented in CLAUDE.md.
         if (MH_Initialize() == MH_OK)
-            flog("MinHook initialized (no hooks created yet -- see CLAUDE.md)");
+            flog("MinHook initialized");
         else
             flog("[WARN] MinHook init failed");
 
