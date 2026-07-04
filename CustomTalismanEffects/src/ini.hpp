@@ -59,6 +59,13 @@ public:
         try { return std::stof(v); } catch (...) { return def; }
     }
 
+    int get_int(const std::string& sec, const std::string& key, int def) const {
+        const std::string v = get_string(sec, key);
+        if (v.empty()) return def;
+        try { return std::stoi(v); }
+        catch (...) { return def; }
+    }
+
     // Enumerate every key = value pair in a section (in no particular order).
     // Returns an empty list if the section is absent. Used to read the
     // [talismans] block without knowing the names up front.

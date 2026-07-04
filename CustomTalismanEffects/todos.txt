@@ -1,0 +1,6 @@
+remove Entwining Umbilical Cord (or add that it's cut content) and make it more visible if so.
+
+if I have a talisman of a family equipped (and stacking is off) and if the mod operates by not addind 2 of the same family together without stacking
+then make the other family talismans unavailable in the overlay and in the description add a text saying that the player has a talisman equipped which doesn't allow the use of this particular talisman.
+
+but make that only if they don't actually stack. If the effects stack If i have a talisman equipped and then check another of the same family, that's ok I guess.

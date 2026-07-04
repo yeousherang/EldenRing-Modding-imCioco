@@ -1,8 +1,17 @@
 #include "state.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <unordered_set>
 
 namespace cte {
+
+namespace {
+std::string to_lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+} // namespace
 
 std::mutex g_state_mutex;
 State      g_state;
@@ -27,6 +36,27 @@ void collapse_groups_locked() {
             t.enabled = false;      // a member of this family is already on
         else
             seen.insert(t.group);
+    }
+}
+
+void sort_talismans_locked() {
+    auto& v = g_state.talismans;
+    switch (g_state.sort_mode) {
+    case 1: // Name (alphabetical)
+        std::stable_sort(v.begin(), v.end(), [](const Talisman& a, const Talisman& b) {
+            return to_lower(a.name) < to_lower(b.name);
+        });
+        break;
+    case 2: // In-game menu order
+        std::stable_sort(v.begin(), v.end(), [](const Talisman& a, const Talisman& b) {
+            return a.sort_id < b.sort_id;
+        });
+        break;
+    default: // 0 = Talisman ID
+        std::stable_sort(v.begin(), v.end(), [](const Talisman& a, const Talisman& b) {
+            return a.accessory_id < b.accessory_id;
+        });
+        break;
     }
 }
 

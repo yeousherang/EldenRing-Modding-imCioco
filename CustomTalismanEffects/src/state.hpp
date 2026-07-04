@@ -18,6 +18,7 @@ struct Talisman {
     std::string      name;                 // Paramdex display name (.ini key)
     std::string      effect;               // human-readable effect (overlay hover text)
     int              group = -1;           // accessoryGroup; -1 == no family
+    int              sort_id = 0;          // sortId (EquipParamAccessory) == in-game menu order
     std::vector<int> sp_ids;               // resident SpEffect ids (>0)
     bool             enabled = false;      // desired on/off
 };
@@ -32,6 +33,9 @@ struct State {
     unsigned short open_pad_mask = 0x00C0; // XINPUT LEFT_THUMB | RIGHT_THUMB (L3+R3)
 
     bool save_requested = false;           // overlay asked to persist to the .ini
+
+    bool show_descriptions = true;
+    int  sort_mode = 0; // 0 = Talisman ID, 1 = Name, 2 = Group (in-game order)
 
     // SpEffect ids active on the player from a source OTHER than this mod
     // (i.e. an actually-equipped talisman). Published by the worker loop each
@@ -53,5 +57,9 @@ void apply_exclusivity_locked(size_t idx);
 // Collapse every family to at most one enabled member (used when stacking is
 // turned back off, and at startup after loading the .ini).
 void collapse_groups_locked();
+
+// Re-sort g_state.talismans in place according to g_state.sort_mode
+// (0 = Talisman ID, 1 = Name, 2 = In-game menu order / sortId).
+void sort_talismans_locked();
 
 } // namespace cte

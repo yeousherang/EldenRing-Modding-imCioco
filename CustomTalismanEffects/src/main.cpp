@@ -124,6 +124,8 @@ struct IniConfig {
     bool           allow_stacking = false;
     unsigned int   open_vk = VK_INSERT;
     unsigned short open_pad_mask = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
+    bool show_descriptions = true;
+    int  sort_mode = 0;
 };
 
 IniConfig load_config(const Ini& ini) {
@@ -132,6 +134,8 @@ IniConfig load_config(const Ini& ini) {
     c.open_vk = parse_open_key(ini.get_string("overlay", "toggle_key", "Insert"), VK_INSERT);
     c.open_pad_mask = parse_pad_mask(ini.get_string("overlay", "toggle_gamepad_combo", "L3+R3"),
                                      XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB);
+    c.show_descriptions = ini.get_bool("overlay", "show_descriptions", true);
+    c.sort_mode = ini.get_int("overlay", "sort_mode", 0);
     for (const auto& kv : ini.section_items("talismans"))
         if (Ini::as_bool(kv.second))
             c.enabled.insert(normalize(kv.first));
@@ -146,6 +150,8 @@ void build_state(const IniConfig& cfg) {
     g_state.allow_stacking = cfg.allow_stacking;
     g_state.open_vk = cfg.open_vk;
     g_state.open_pad_mask = cfg.open_pad_mask;
+    g_state.show_descriptions = cfg.show_descriptions;
+    g_state.sort_mode = cfg.sort_mode;
     g_state.talismans.clear();
 
     // A talisman's effect lives in one (or both) of two places on its accessory
@@ -169,6 +175,7 @@ void build_state(const IniConfig& cfg) {
         t.accessory_id = e.id;
         t.name = e.name;
         t.group = row.accessoryGroup;
+        t.sort_id = row.sortId;
 
         auto add_id = [&](int id) {
             if (!sp_exists(id)) return false;
@@ -200,7 +207,10 @@ void build_state(const IniConfig& cfg) {
         t.enabled = cfg.enabled.count(normalize(t.name)) != 0;
         g_state.talismans.push_back(std::move(t));
     }
-    collapse_groups_locked(); // honor exclusivity for the loaded .ini selection
+    if (!cfg.allow_stacking) {
+        collapse_groups_locked(); // honor exclusivity for the loaded .ini selection /+ unless stacking option is enabled.
+    }
+    sort_talismans_locked();
     flog("built %zu talismans (%d not in regulation, %d without effects; "
          "%d have a refId effect, %d have resident effect(s))",
          g_state.talismans.size(), missing, noeffect, from_ref, from_resident);
@@ -214,13 +224,17 @@ void save_config() {
     std::ifstream in(path);
     if (!in) { flog("[WARN] save: cannot open .ini for read"); return; }
 
-    // Snapshot enabled-by-name + allow_stacking under the lock.
+    // Snapshot enabled-by-name + overlay options under the lock.
     std::unordered_map<std::string, bool> want;
     bool allow_stacking;
+    bool show_descriptions;
+    int  sort_mode;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         for (const auto& t : g_state.talismans) want[normalize(t.name)] = t.enabled;
         allow_stacking = g_state.allow_stacking;
+        show_descriptions = g_state.show_descriptions;
+        sort_mode = g_state.sort_mode;
     }
 
     std::vector<std::string> out;
@@ -254,6 +268,12 @@ void save_config() {
                 }
             } else if (section == "overlay" && normalize(key_trim) == "allow_stacking") {
                 std::string nv = allow_stacking ? "1" : "0";
+                line = key + "= " + nv + (comment.empty() ? "" : " " + comment);
+            } else if (section == "overlay" && normalize(key_trim) == "show_descriptions") {
+                std::string nv = show_descriptions ? "1" : "0";
+                line = key + "= " + nv + (comment.empty() ? "" : " " + comment);
+            } else if (section == "overlay" && normalize(key_trim) == "sort_mode") {
+                std::string nv = std::to_string(sort_mode);
                 line = key + "= " + nv + (comment.empty() ? "" : " " + comment);
             }
         }

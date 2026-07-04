@@ -551,9 +551,15 @@ void draw_talisman_window() {
 
     ImGui::Separator();
 
-    // Reserve ~3 lines at the bottom for the effect detail of the hovered/focused row.
-    const float detail_h = ImGui::GetTextLineHeightWithSpacing() * 3.0f + 8.0f;
-    ImGui::BeginChild("##list", ImVec2(0, -detail_h), ImGuiChildFlags_NavFlattened);
+    // Reserve room at the bottom for the sort/description controls, plus a
+    // fixed-size (~4 lines) effect detail pane when descriptions are enabled.
+    // Both are a constant height regardless of content, so they never shift
+    // the list or each other around as the hovered talisman's text changes.
+    const float controls_h = ImGui::GetFrameHeightWithSpacing() + 4.0f;
+    const float detail_h = g_state.show_descriptions
+        ? ImGui::GetTextLineHeightWithSpacing() * 4.0f + 8.0f
+        : 0.0f;
+    ImGui::BeginChild("##list", ImVec2(0, -(controls_h + detail_h)), ImGuiChildFlags_NavFlattened);
     const std::string needle = to_lower(filter);
     const Talisman* detail = nullptr; // row hovered by mouse OR focused by gamepad nav
     bool detail_equipped = false;
@@ -598,17 +604,37 @@ void draw_talisman_window() {
     }
     ImGui::EndChild();
 
-    // Detail pane: effect of whichever row the mouse/controller is on.
-    ImGui::Separator();
-    if (detail) {
-        ImGui::TextColored(detail_equipped ? kEquippedCol : ImVec4(0.80f, 0.68f, 0.40f, 1.0f),
-                           "%s%s", detail->name.c_str(), detail_equipped ? "  (equipped)" : "");
-        ImGui::TextWrapped("%s", detail->effect.empty()
-            ? "(no description yet -- add it in talisman_names.hpp)"
-            : detail->effect.c_str());
-    } else {
-        ImGui::TextDisabled("Hover or select a talisman to see its effect.");
+    // Detail pane: effect of whichever row the mouse/controller is on. Fixed-height
+    // child (matching detail_h above) so long descriptions scroll instead of
+    // pushing the controls below it around.
+    if (g_state.show_descriptions) {
+        ImGui::Separator();
+        ImGui::BeginChild("##detail", ImVec2(0, detail_h - 8.0f));
+        if (detail) {
+            ImGui::TextColored(detail_equipped ? kEquippedCol : ImVec4(0.80f, 0.68f, 0.40f, 1.0f),
+                               "%s%s", detail->name.c_str(), detail_equipped ? "  (equipped)" : "");
+            ImGui::TextWrapped("%s", detail->effect.empty()
+                ? "(no description yet)"
+                : detail->effect.c_str());
+        } else {
+            ImGui::TextDisabled("Hover or select a talisman to see its effect.");
+        }
+        ImGui::EndChild();
     }
+
+    // Bottom controls: sort order + description-pane toggle.
+    ImGui::Separator();
+    static const char* kSortLabels[] = { "Talisman ID", "Name (A-Z)", "In-Game Order" };
+    int sort_mode = g_state.sort_mode;
+    ImGui::SetNextItemWidth(160.0f);
+    if (ImGui::Combo("Sort by", &sort_mode, kSortLabels, IM_ARRAYSIZE(kSortLabels))) {
+        g_state.sort_mode = sort_mode;
+        sort_talismans_locked();
+    }
+    ImGui::SameLine();
+    bool show_desc = g_state.show_descriptions;
+    if (ImGui::Checkbox("Show descriptions", &show_desc))
+        g_state.show_descriptions = show_desc;
 
     ImGui::End();
 }
