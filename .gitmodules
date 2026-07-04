@@ -4,9 +4,15 @@
 [submodule "AdjustableSummonCost/external/libER"]
 	path = AdjustableSummonCost/external/libER
 	url = https://github.com/Dasaav-dsv/libER
+[submodule "AdjustableSpellCost/external/libER"]
+	path = AdjustableSpellCost/external/libER
+	url = https://github.com/Dasaav-dsv/libER
 [submodule "PersistentBuffs/external/minhook"]
 	path = PersistentBuffs/external/minhook
 	url = https://github.com/TsudaKageyu/minhook.git
 [submodule "PersistentBuffs/external/libER"]
 	path = PersistentBuffs/external/libER
+	url = https://github.com/Dasaav-dsv/libER
+[submodule "CustomTalismanEffects/external/libER"]
+	path = CustomTalismanEffects/external/libER
 	url = https://github.com/Dasaav-dsv/libER

@@ -9,10 +9,10 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 class Ini {
 public:
+    // Returns false if the file could not be opened.
     bool load(const std::wstring& path) {
         std::ifstream f(path);
         if (!f) return false;
@@ -45,25 +45,16 @@ public:
         return ki == si->second.end() ? def : ki->second;
     }
 
-    int get_int(const std::string& sec, const std::string& key, int def) const {
-        const std::string v = trim(get_string(sec, key));
-        if (v.empty()) return def;
-        try { return std::stoi(v); } catch (...) { return def; }
-    }
-
     bool get_bool(const std::string& sec, const std::string& key, bool def) const {
         const std::string v = lower(get_string(sec, key));
         if (v.empty()) return def;
         return v == "1" || v == "true" || v == "yes" || v == "on";
     }
 
-    // All section names seen in the file (order unspecified). Used by
-    // session_store to iterate the per-character [char_*] sections on load.
-    std::vector<std::string> section_names() const {
-        std::vector<std::string> out;
-        out.reserve(data_.size());
-        for (const auto& kv : data_) out.push_back(kv.first);
-        return out;
+    float get_float(const std::string& sec, const std::string& key, float def) const {
+        const std::string v = get_string(sec, key);
+        if (v.empty()) return def;
+        try { return std::stof(v); } catch (...) { return def; }
     }
 
 private:
@@ -71,17 +62,20 @@ private:
         const size_t p = s.find_first_of(";#");
         return p == std::string::npos ? s : s.substr(0, p);
     }
+
     static std::string trim(const std::string& s) {
         const size_t a = s.find_first_not_of(" \t\r\n");
         if (a == std::string::npos) return "";
         const size_t b = s.find_last_not_of(" \t\r\n");
         return s.substr(a, b - a + 1);
     }
+
     static std::string lower(std::string s) {
         std::transform(s.begin(), s.end(), s.begin(),
                        [](unsigned char c) { return (char)std::tolower(c); });
         return s;
     }
+
     std::unordered_map<std::string,
         std::unordered_map<std::string, std::string>> data_;
 };

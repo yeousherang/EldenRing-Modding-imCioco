@@ -14,6 +14,23 @@ add_definitions(-D_ITERATOR_DEBUG_LEVEL=0)
 add_subdirectory("external/libER" "libER")
 
 add_library(${PROJECT_NAME} SHARED
+    src/ini.hpp
+    src/utils.hpp
+    src/utils.cpp
+    src/config.hpp
+    src/config.cpp
+    src/speffect_lookup.hpp
+    src/speffect_lookup.cpp
+    src/buff_filters.hpp
+    src/buff_filters.cpp
+    src/horse_protection.hpp
+    src/horse_protection.cpp
+    src/dual_wield.hpp
+    src/dual_wield.cpp
+    src/apply.hpp
+    src/apply.cpp
+    src/discover.hpp
+    src/discover.cpp
     src/main.cpp
 )
 

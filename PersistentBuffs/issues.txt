@@ -1,0 +1,19 @@
+FIX IMPLEMENTED -- pending in-game verification (see CLAUDE.md + steps below):
+
+1. weapon memory does not persist with the persistentbuffs.state.ini. If I change my weapon, the buffs applied to that weapon are erased from the memory.
+   -> weapon-memory bindings are now saved per character as `weapon_buffs = id:weapon:remaining` triples in PersistentBuffs.state.ini
+      (written whenever remember_per_weapon OR remember_across_sessions is on; restored on launch when remember_across_sessions is on).
+
+2. if i reapply a grease while the same grease is already applied, the timer doesn't reset in the memory file.
+   -> the mod now hooks the game's ApplySpEffect function: any (re)application of a persistable buff on the player resets its
+      tracked timer to the full duration, even when the buff never disappeared. Startup log line to confirm:
+      "buff timing: reapplication hook installed on ApplySpEffect".
+
+In-game verification:
+ V-A (bug 1): remember_per_weapon=1 + remember_across_sessions=1. Grease weapon A, swap to B, quit the game fully,
+      relaunch, load the same character, swap back to A. PASS: grease returns with ~the right remaining time;
+      the state file shows a weapon_buffs line before the restart; log shows "session: restored N weapon binding(s)".
+ V-B (bug 2): grease a weapon, wait ~half the duration, reapply the same grease. PASS: log shows
+      "timing: <id> (re)applied by the game -> timer reset to full" and the buff lasts the full duration from the recast.
+ V-C (stability): play a few minutes normally (fights, spells, NPC-heavy area) -- no stutter/crash from the hook.
+ V-D (regression): rerun CLAUDE.md checklist V1/V5/V6 (expired buffs stay dead; weapon swap-back restore still works).

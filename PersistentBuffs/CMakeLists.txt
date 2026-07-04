@@ -20,6 +20,26 @@ add_subdirectory(external/libER libER)
 
 # --- the mod DLL ------------------------------------------------------------
 add_library(PersistentBuffs SHARED
+    src/ini.hpp
+    src/scan.hpp
+    src/utils.hpp
+    src/utils.cpp
+    src/config.hpp
+    src/config.cpp
+    src/offsets.hpp
+    src/offsets.cpp
+    src/game_access.hpp
+    src/game_access.cpp
+    src/buff_filters.hpp
+    src/buff_filters.cpp
+    src/buff_discovery.hpp
+    src/buff_discovery.cpp
+    src/buff_timing.hpp
+    src/buff_timing.cpp
+    src/weapon_memory.hpp
+    src/weapon_memory.cpp
+    src/session_store.hpp
+    src/session_store.cpp
     src/main.cpp
 )
 
