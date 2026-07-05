@@ -36,6 +36,7 @@
 #include "hooks.hpp"
 #include "ini.hpp"
 #include "log.hpp"
+#include "messages.hpp"
 #include "offsets.hpp"
 #include "overlay.hpp"
 #include "state.hpp"
@@ -124,6 +125,8 @@ struct IniConfig {
     bool           allow_stacking = false;
     unsigned int   open_vk = VK_INSERT;
     unsigned short open_pad_mask = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
+    std::string    open_key_label = "Insert"; // raw .ini strings, for the overlay footer
+    std::string    open_pad_label = "L3+R3";
     bool show_descriptions = true;
     int  sort_mode = 0;
 };
@@ -131,8 +134,10 @@ struct IniConfig {
 IniConfig load_config(const Ini& ini) {
     IniConfig c;
     c.allow_stacking = ini.get_bool("overlay", "allow_stacking", false);
-    c.open_vk = parse_open_key(ini.get_string("overlay", "toggle_key", "Insert"), VK_INSERT);
-    c.open_pad_mask = parse_pad_mask(ini.get_string("overlay", "toggle_gamepad_combo", "L3+R3"),
+    c.open_key_label = ini.get_string("overlay", "toggle_key", "Insert");
+    c.open_pad_label = ini.get_string("overlay", "toggle_gamepad_combo", "L3+R3");
+    c.open_vk = parse_open_key(c.open_key_label, VK_INSERT);
+    c.open_pad_mask = parse_pad_mask(c.open_pad_label,
                                      XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB);
     c.show_descriptions = ini.get_bool("overlay", "show_descriptions", true);
     c.sort_mode = ini.get_int("overlay", "sort_mode", 0);
@@ -142,17 +147,47 @@ IniConfig load_config(const Ini& ini) {
     return c;
 }
 
-// After params load, build the shared talisman model: for every talisman in the
-// embedded table that exists in this regulation and has a resident effect, read
-// its accessoryGroup + residentSpEffectId1..4. Enabled flag comes from the .ini.
+// id -> baked table entry (curated name + effect). Built once. Doubles as the
+// set of "base game" ids used to split the overlay into Base vs Mod-Added.
+const std::unordered_map<int, const TalismanEntry*>& baked_by_id() {
+    static const std::unordered_map<int, const TalismanEntry*> m = [] {
+        std::unordered_map<int, const TalismanEntry*> t;
+        t.reserve(kTalismanCount);
+        for (const auto& e : kTalismans) t.emplace(e.id, &e);
+        return t;
+    }();
+    return m;
+}
+
+// After params load, build the shared talisman model by walking EVERY row of the
+// live EquipParamAccessory -- so mod-added talismans are picked up automatically,
+// not just the baked base-game set. For each row we read accessoryGroup +
+// resident/refId SpEffects live, and resolve the display NAME (and, as a
+// fallback, the effect text) from the game's live message repository so renamed /
+// repurposed talismans (Reforged, The Convergence) show correctly. Enabled flag
+// comes from the .ini (keyed by name).
 void build_state(const IniConfig& cfg) {
+    // Live talisman names/effects from the game's message repository (mod-aware).
+    // Feed it the full live accessory id set -- it fingerprints the description
+    // FMG slots by matching their resolving-string id sets against these ids.
+    std::vector<int> all_ids;
+    for (auto [pid, row] : from::param::EquipParamAccessory) {
+        (void)row;
+        all_ids.push_back(static_cast<int>(pid));
+    }
+    const bool live = messages::init(all_ids);
+
     std::lock_guard<std::mutex> lk(g_state_mutex);
     g_state.allow_stacking = cfg.allow_stacking;
     g_state.open_vk = cfg.open_vk;
     g_state.open_pad_mask = cfg.open_pad_mask;
+    g_state.open_key_label = cfg.open_key_label;
+    g_state.open_pad_label = cfg.open_pad_label;
     g_state.show_descriptions = cfg.show_descriptions;
     g_state.sort_mode = cfg.sort_mode;
     g_state.talismans.clear();
+
+    const auto& baked = baked_by_id();
 
     // A talisman's effect lives in one (or both) of two places on its accessory
     // row: `refId` -- the SpEffect it grants while worn (the common case; only
@@ -166,14 +201,10 @@ void build_state(const IniConfig& cfg) {
         return sok;
     };
 
-    int missing = 0, noeffect = 0, from_ref = 0, from_resident = 0;
-    for (const auto& e : kTalismans) {
-        auto [row, ok] = from::param::EquipParamAccessory[e.id];
-        if (!ok) { ++missing; continue; } // DLC not owned, etc.
-
+    int noeffect = 0, noname = 0, from_ref = 0, from_resident = 0, mod_added = 0;
+    for (auto [pid, row] : from::param::EquipParamAccessory) {
         Talisman t;
-        t.accessory_id = e.id;
-        t.name = e.name;
+        t.accessory_id = static_cast<int>(pid);
         t.group = row.accessoryGroup;
         t.sort_id = row.sortId;
 
@@ -190,30 +221,51 @@ void build_state(const IniConfig& cfg) {
                         row.residentSpEffectId3, row.residentSpEffectId4 })
             if (add_id(sp)) res_hit = true;
 
-        if (t.sp_ids.empty()) {
-            ++noeffect;
-            if (noeffect <= 25)
-                flog("  no-effect talisman \"%s\" acc=%d refId=%d refCat=%d res=[%d,%d,%d,%d]",
-                     t.name.c_str(), t.accessory_id, row.refId, (int)row.refCategory,
-                     row.residentSpEffectId1, row.residentSpEffectId2,
-                     row.residentSpEffectId3, row.residentSpEffectId4);
-            continue;
-        }
+        if (t.sp_ids.empty()) { ++noeffect; continue; } // not a passive-buff talisman
+
+        const auto it = baked.find(t.accessory_id);
+        t.is_base = it != baked.end();
+
+        // Name: live FMG (correct for any mod / rename) -> baked -> skip the row.
+        // A row with neither a live nor a baked name is a template/system entry.
+        if (live) t.name = messages::accessory_name(t.accessory_id);
+        if (t.name.empty() && it != baked.end()) t.name = it->second->name;
+        if (t.name.empty()) { ++noname; continue; }
+
+        // Effect: curated baked text preferred; else live AccessoryInfo/Caption.
+        if (it != baked.end() && it->second->effect[0] != '\0')
+            t.effect = it->second->effect;
+        else if (live)
+            t.effect = messages::accessory_effect(t.accessory_id);
+
         if (ref_hit) ++from_ref;
         if (res_hit) ++from_resident;
-
-        t.effect = e.effect; // baked-in hover text (talisman_names.hpp)
+        if (!t.is_base) ++mod_added;
 
         t.enabled = cfg.enabled.count(normalize(t.name)) != 0;
         g_state.talismans.push_back(std::move(t));
     }
+
+    g_state.has_mod_added = mod_added > 0;
+
+    // With an overhaul loaded, it typically also retunes VANILLA talismans, so
+    // our baked descriptions can go stale. Read EVERY description live from the
+    // game in that case (keeping the baked text only where the game has none).
+    // On the plain vanilla game we keep the curated baked descriptions.
+    if (live && mod_added > 0) {
+        for (auto& t : g_state.talismans) {
+            std::string le = messages::accessory_effect(t.accessory_id);
+            if (!le.empty()) t.effect = std::move(le);
+        }
+    }
+
     if (!cfg.allow_stacking) {
         collapse_groups_locked(); // honor exclusivity for the loaded .ini selection /+ unless stacking option is enabled.
     }
     sort_talismans_locked();
-    flog("built %zu talismans (%d not in regulation, %d without effects; "
+    flog("built %zu talismans (%d mod-added, %d without effects, %d unnamed; "
          "%d have a refId effect, %d have resident effect(s))",
-         g_state.talismans.size(), missing, noeffect, from_ref, from_resident);
+         g_state.talismans.size(), mod_added, noeffect, noname, from_ref, from_resident);
 }
 
 // Rewrite the .ini in place: flip each [talismans] Name to the current enabled
@@ -224,20 +276,29 @@ void save_config() {
     std::ifstream in(path);
     if (!in) { flog("[WARN] save: cannot open .ini for read"); return; }
 
-    // Snapshot enabled-by-name + overlay options under the lock.
-    std::unordered_map<std::string, bool> want;
+    // Snapshot selections (display name + enabled) + overlay options under the
+    // lock. Keep display names so mod-added talismans absent from the .ini can be
+    // appended as new lines below.
+    struct Sel { std::string display, norm; bool enabled; };
+    std::vector<Sel> sels;
+    std::unordered_map<std::string, bool> want; // normalized name -> enabled
     bool allow_stacking;
     bool show_descriptions;
     int  sort_mode;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        for (const auto& t : g_state.talismans) want[normalize(t.name)] = t.enabled;
+        for (const auto& t : g_state.talismans) {
+            sels.push_back({t.name, normalize(t.name), t.enabled});
+            want[normalize(t.name)] = t.enabled;
+        }
         allow_stacking = g_state.allow_stacking;
         show_descriptions = g_state.show_descriptions;
         sort_mode = g_state.sort_mode;
     }
 
     std::vector<std::string> out;
+    std::unordered_set<std::string> present; // normalized [talismans] keys already in the file
+    int tal_end = -1;                        // out index just after the last [talismans] entry
     std::string line, section;
     while (std::getline(in, line)) {
         std::string trimmed = line;
@@ -261,6 +322,7 @@ void save_config() {
             std::string comment = (hash == std::string::npos) ? "" : rest.substr(hash);
 
             if (section == "talismans") {
+                present.insert(normalize(key_trim));
                 auto it = want.find(normalize(key_trim));
                 if (it != want.end()) {
                     std::string nv = it->second ? "1" : "0";
@@ -278,8 +340,29 @@ void save_config() {
             }
         }
         out.push_back(line);
+        if (section == "talismans" && eq != std::string::npos)
+            tal_end = static_cast<int>(out.size()); // insert new entries after the last one
     }
     in.close();
+
+    // Append talismans that aren't in the file yet (mod-added ones enabled via the
+    // overlay). Name-keyed, so two talismans sharing a normalized name collapse to
+    // one line (a known limitation of name keying) -- dedup on the normalized key.
+    std::vector<std::string> added;
+    std::unordered_set<std::string> added_norm;
+    for (const auto& s : sels) {
+        if (present.count(s.norm) || !added_norm.insert(s.norm).second) continue;
+        added.push_back(s.display + " = " + (s.enabled ? "1" : "0"));
+    }
+    if (!added.empty()) {
+        if (tal_end < 0 || tal_end > static_cast<int>(out.size())) { // no [talismans] section found
+            out.push_back("");
+            out.push_back("[talismans]");
+            tal_end = static_cast<int>(out.size());
+        }
+        out.insert(out.begin() + tal_end, added.begin(), added.end());
+        flog("added %zu mod-added talisman(s) to the .ini", added.size());
+    }
 
     std::ofstream of(path, std::ios::trunc);
     if (!of) { flog("[WARN] save: cannot open .ini for write"); return; }

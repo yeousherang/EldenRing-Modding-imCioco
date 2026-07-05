@@ -18,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#include <shellapi.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <Xinput.h>
@@ -40,9 +41,14 @@
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "shell32.lib")
 
 namespace cte {
 namespace {
+
+// Mod page opened by the small "Nexus" button in the overlay. Leave empty ("")
+// to hide the button entirely.
+constexpr const char* kModPageUrl = "https://www.nexusmods.com/eldenring/mods/10327";
 
 using Present_t = HRESULT(WINAPI*)(IDXGISwapChain3*, UINT, UINT);
 using ResizeBuffers_t = HRESULT(WINAPI*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
@@ -78,6 +84,10 @@ bool  g_os_cursor = false;
 struct KeyEv { ImGuiKey key; bool down; };
 std::mutex           g_key_mtx;
 std::vector<KeyEv>   g_key_events;
+// Text input for ImGui widgets (the search box). The WndProc swallows WM_CHAR
+// while the menu is open, so characters are synthesized from the raw keyboard
+// events (ToUnicode) and fed to ImGui as InputCharacter events.
+std::vector<wchar_t> g_char_events; // guarded by g_key_mtx
 
 // ---- DX12 state ----
 struct FrameContext {
@@ -132,6 +142,24 @@ void apply_er_style() {
     c[ImGuiCol_TextDisabled] = ImVec4(0.55f, 0.50f, 0.40f, 1.0f);
     c[ImGuiCol_Border] = ImVec4(0.50f, 0.42f, 0.25f, 0.6f);
     c[ImGuiCol_NavHighlight] = gold; //ImVec4(0.80f, 0.68f, 0.40f, 0.80f); // Golden
+    // Tabs (Base/Mod-Added bar), separators, scrollbars, resize grips and text
+    // selection all default to ImGui blue -- bring them into the gold theme.
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.30f, 0.24f, 0.13f, 1.0f);
+    c[ImGuiCol_Tab] = ImVec4(0.22f, 0.17f, 0.08f, 1.0f);
+    c[ImGuiCol_TabHovered] = ImVec4(0.45f, 0.36f, 0.18f, 1.0f);
+    c[ImGuiCol_TabActive] = ImVec4(0.35f, 0.28f, 0.14f, 1.0f);
+    c[ImGuiCol_TabUnfocused] = ImVec4(0.12f, 0.10f, 0.05f, 1.0f);
+    c[ImGuiCol_TabUnfocusedActive] = ImVec4(0.25f, 0.20f, 0.10f, 1.0f);
+    c[ImGuiCol_Separator] = ImVec4(0.50f, 0.42f, 0.25f, 0.6f);
+    c[ImGuiCol_SeparatorHovered] = ImVec4(0.65f, 0.53f, 0.30f, 0.8f);
+    c[ImGuiCol_SeparatorActive] = gold;
+    c[ImGuiCol_ResizeGrip] = ImVec4(0.30f, 0.24f, 0.12f, 0.6f);
+    c[ImGuiCol_ResizeGripHovered] = ImVec4(0.45f, 0.36f, 0.18f, 0.8f);
+    c[ImGuiCol_ResizeGripActive] = gold;
+    c[ImGuiCol_ScrollbarGrab] = ImVec4(0.30f, 0.24f, 0.12f, 1.0f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.45f, 0.36f, 0.18f, 1.0f);
+    c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.55f, 0.44f, 0.22f, 1.0f);
+    c[ImGuiCol_TextSelectedBg] = ImVec4(0.55f, 0.44f, 0.22f, 0.5f);
 }
 
 // ── gamepad helpers ──
@@ -263,9 +291,21 @@ UINT WINAPI hkGetRawInputData(HRAWINPUT hri, UINT cmd, LPVOID data, PUINT size, 
         const RAWKEYBOARD& kb = ri->data.keyboard;
         const bool down = (kb.Flags & RI_KEY_BREAK) == 0;
         ImGuiKey k = vk_to_imgui(kb.VKey);
-        if (k != ImGuiKey_None) {
+        if (k != ImGuiKey_None || down) {
             std::lock_guard<std::mutex> lk(g_key_mtx);
-            g_key_events.push_back({k, down});
+            if (k != ImGuiKey_None) g_key_events.push_back({k, down});
+            // Synthesize the character (layout-aware, shift-aware) so text
+            // widgets receive typed input despite WM_CHAR being swallowed.
+            if (down) {
+                BYTE ks[256];
+                if (GetKeyboardState(ks)) {
+                    wchar_t buf[4]{};
+                    const int n = ToUnicode(kb.VKey, kb.MakeCode, ks, buf, 4, 0);
+                    for (int i = 0; i < n; ++i)
+                        if (buf[i] >= 0x20 && buf[i] != 0x7F) // printable only
+                            g_char_events.push_back(buf[i]);
+                }
+            }
         }
         ri->data.keyboard.VKey = 0;
         ri->data.keyboard.MakeCode = 0;
@@ -336,6 +376,8 @@ void feed_input() {
         std::lock_guard<std::mutex> lk(g_key_mtx);
         for (const auto& e : g_key_events) io.AddKeyEvent(e.key, e.down);
         g_key_events.clear();
+        for (wchar_t c : g_char_events) io.AddInputCharacterUTF16(static_cast<ImWchar16>(c));
+        g_char_events.clear();
     }
     if (g_pad_ok) {
         io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
@@ -528,6 +570,12 @@ void draw_talisman_window() {
         g_state.allow_stacking = stacking;
         if (!stacking) collapse_groups_locked();
     }
+    if (kModPageUrl[0] != '\0') {
+        // Small corner link to the mod page (opens the default browser).
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 52.0f);
+        if (ImGui::SmallButton("Nexus"))
+            ShellExecuteA(nullptr, "open", kModPageUrl, nullptr, nullptr, SW_SHOWNORMAL);
+    }
 
     static char filter[64] = "";
     ImGui::SetNextItemWidth(-90.0f);
@@ -547,62 +595,122 @@ void draw_talisman_window() {
     // Talismans currently worn on the character are drawn in this color; when
     // stacking is off they're also greyed out / non-toggleable (already active).
     const ImVec4 kEquippedCol(0.45f, 0.78f, 0.98f, 1.0f);
-    ImGui::TextColored(kEquippedCol, "Blue = already equipped on your character");
+    // ImGui::TextColored(kEquippedCol, "Blue = already equipped on your character"); // removed the text line. "equipped" is now shown on the item name.
 
     ImGui::Separator();
 
-    // Reserve room at the bottom for the sort/description controls, plus a
-    // fixed-size (~4 lines) effect detail pane when descriptions are enabled.
-    // Both are a constant height regardless of content, so they never shift
-    // the list or each other around as the hovered talisman's text changes.
-    const float controls_h = ImGui::GetFrameHeightWithSpacing() + 4.0f;
+    // Hotkey hint footer text (labels come straight from the .ini). Built up
+    // front so its WRAPPED height at the current window width can be reserved
+    // -- on narrow windows it flows to 2+ lines instead of clipping.
+    std::string footer = g_state.open_key_label + " or " + g_state.open_pad_label +
+                         ": open/close  |  Esc or B (pad): close & save";
+    if (g_state.has_mod_added) footer += "  |  LB/RB: switch tab";
+    const float wrap_w = ImGui::GetContentRegionAvail().x;
+    const float footer_h =
+        ImGui::CalcTextSize(footer.c_str(), nullptr, false, wrap_w).y + 4.0f;
+
+    // Reserve room at the bottom for the sort/description controls + the
+    // hotkey hint footer, plus a fixed-size (~4 lines) effect detail pane when
+    // descriptions are enabled. All constant heights per frame, so they never
+    // shift the list or each other around as the hovered talisman's text
+    // changes.
+    const float controls_h = ImGui::GetFrameHeightWithSpacing() + footer_h + 4.0f;
     const float detail_h = g_state.show_descriptions
         ? ImGui::GetTextLineHeightWithSpacing() * 4.0f + 8.0f
         : 0.0f;
-    ImGui::BeginChild("##list", ImVec2(0, -(controls_h + detail_h)), ImGuiChildFlags_NavFlattened);
     const std::string needle = to_lower(filter);
     const Talisman* detail = nullptr; // row hovered by mouse OR focused by gamepad nav
     bool detail_equipped = false;
-    for (size_t i = 0; i < g_state.talismans.size(); ++i) {
-        Talisman& t = g_state.talismans[i];
-        if (!needle.empty() && to_lower(t.name).find(needle) == std::string::npos) continue;
 
-        // Equipped = one of this talisman's effects is active on the player from a
-        // source other than us (the real talisman is worn). Lock it while stacking
-        // is off, since re-applying our copy would be redundant.
-        bool equipped = false;
-        for (int sp : t.sp_ids)
-            if (g_state.external_active.count(sp)) { equipped = true; break; }
-        const bool lock_it = equipped; // always lock if equipped
-        // even when stacking is on. because effects of the same talisman can't be stacked, so it's a better behavior to keep it locked all times.
+    // Render the search-filtered rows for one tab: base_tab==true shows base-game
+    // talismans, false shows mod-added ones (ids not in the baked table). Assumes
+    // g_state_mutex is held (it is). `i` is the index into g_state.talismans, kept
+    // as the ImGui id so it stays unique/stable across both tabs.
+    auto render_rows = [&](bool base_tab) {
+        int shown = 0;
+        for (size_t i = 0; i < g_state.talismans.size(); ++i) {
+            Talisman& t = g_state.talismans[i];
+            if (t.is_base != base_tab) continue;
+            if (!needle.empty() && to_lower(t.name).find(needle) == std::string::npos) continue;
+            ++shown;
 
-        ImGui::PushID(static_cast<int>(i));
-        if (equipped) ImGui::PushStyleColor(ImGuiCol_Text, kEquippedCol);
-        if (lock_it)  ImGui::BeginDisabled();
+            // Equipped = one of this talisman's effects is active on the player from
+            // a source other than us (the real talisman is worn). Lock it -- even
+            // when stacking is on -- since re-applying our copy would be redundant.
+            bool equipped = false;
+            for (int sp : t.sp_ids)
+                if (g_state.external_active.count(sp)) { equipped = true; break; }
+            const bool lock_it = equipped;
 
-        bool v = lock_it ? true : t.enabled; // a locked/equipped row reads as active
-        if (ImGui::Checkbox(t.name.c_str(), &v)) {
-            t.enabled = v;
-            if (v) apply_exclusivity_locked(i);
+            ImGui::PushID(static_cast<int>(i));
+            if (equipped) ImGui::PushStyleColor(ImGuiCol_Text, kEquippedCol);
+            if (lock_it)  ImGui::BeginDisabled();
+
+            bool v = lock_it ? true : t.enabled; // a locked/equipped row reads as active
+            std::string label = t.name;
+            if (equipped) {
+                label += " (Already equipped)";
+            }
+            if (ImGui::Checkbox(label.c_str(), &v)) {
+                t.enabled = v;
+                if (v) apply_exclusivity_locked(i);
+            }
+
+            if (lock_it)  ImGui::EndDisabled();
+            if (equipped) ImGui::PopStyleColor();
+
+            // Hover (mouse) OR gamepad focus -> drive the shared detail pane below.
+            if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
+                detail = &t;
+                detail_equipped = equipped;
+            }
+            ImGui::PopID();
         }
+        if (shown == 0)
+            ImGui::TextDisabled(base_tab
+                ? "No talismans match your search."
+                : "No mod-added talismans detected in this regulation.");
+    };
 
-        if (lock_it)  ImGui::EndDisabled();
-        if (equipped) ImGui::PopStyleColor();
+    // Only split into Base/Mod-Added tabs when an overhaul actually added
+    // talismans; on the vanilla game there's a single plain list (no tabs).
+    if (g_state.has_mod_added) {
+        // Controller tab switching: ImGui's nav doesn't drive tab bars, so LB/RB
+        // presses (edge-triggered off the live pad snapshot) select explicitly.
+        static bool prev_lb = false, prev_rb = false;
+        const bool lb = g_pad_ok && (g_pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+        const bool rb = g_pad_ok && (g_pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+        int select_tab = -1; // -1 = no request; 0 = Base, 1 = Mod-Added
+        if (lb && !prev_lb) select_tab = 0;
+        if (rb && !prev_rb) select_tab = 1;
+        prev_lb = lb;
+        prev_rb = rb;
 
-        // Mouse hover -> immediate tooltip; hover OR gamepad focus -> detail pane.
-        // if (ImGui::IsItemHovered()) {
-        //     ImGui::SetTooltip("%s", t.effect.empty()
-        //         ? "(no description yet)"
-        //         : t.effect.c_str());
-        // }
-        // i've disabled this hover text because it's already displayed at the bottom and it's more aestethic this way
-        if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
-            detail = &t;
-            detail_equipped = equipped;
+        if (ImGui::BeginTabBar("##tabs")) {
+            if (ImGui::BeginTabItem("Base Game", nullptr,
+                    select_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::BeginChild("##list_base", ImVec2(0, -(controls_h + detail_h)),
+                                  ImGuiChildFlags_NavFlattened);
+                render_rows(true);
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Mod-Added", nullptr,
+                    select_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::BeginChild("##list_mod", ImVec2(0, -(controls_h + detail_h)),
+                                  ImGuiChildFlags_NavFlattened);
+                render_rows(false);
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
         }
-        ImGui::PopID();
+    } else {
+        ImGui::BeginChild("##list_base", ImVec2(0, -(controls_h + detail_h)),
+                          ImGuiChildFlags_NavFlattened);
+        render_rows(true);
+        ImGui::EndChild();
     }
-    ImGui::EndChild();
 
     // Detail pane: effect of whichever row the mouse/controller is on. Fixed-height
     // child (matching detail_h above) so long descriptions scroll instead of
@@ -635,6 +743,11 @@ void draw_talisman_window() {
     bool show_desc = g_state.show_descriptions;
     if (ImGui::Checkbox("Show descriptions", &show_desc))
         g_state.show_descriptions = show_desc;
+
+    // Hotkey hint footer (string built above; wraps on narrow windows).
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+    ImGui::TextWrapped("%s", footer.c_str());
+    ImGui::PopStyleColor();
 
     ImGui::End();
 }

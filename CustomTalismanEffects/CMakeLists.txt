@@ -40,6 +40,7 @@ add_library(${PROJECT_NAME} SHARED
     src/state.cpp
     src/hooks.cpp
     src/overlay.cpp
+    src/messages.cpp
     # Dear ImGui core + DX12/Win32 backends compiled into the DLL.
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp

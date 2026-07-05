@@ -15,12 +15,13 @@ namespace cte {
 
 struct Talisman {
     int              accessory_id = 0;
-    std::string      name;                 // Paramdex display name (.ini key)
+    std::string      name;                 // display name (live FMG, else baked) -- .ini key
     std::string      effect;               // human-readable effect (overlay hover text)
     int              group = -1;           // accessoryGroup; -1 == no family
     int              sort_id = 0;          // sortId (EquipParamAccessory) == in-game menu order
     std::vector<int> sp_ids;               // resident SpEffect ids (>0)
     bool             enabled = false;      // desired on/off
+    bool             is_base = true;       // id is in the baked base-game table (Base vs Mod-Added tab)
 };
 
 struct State {
@@ -31,11 +32,20 @@ struct State {
     // Overlay open/close inputs (configurable in the .ini).
     unsigned int   open_vk       = 0x2D;   // VK_INSERT
     unsigned short open_pad_mask = 0x00C0; // XINPUT LEFT_THUMB | RIGHT_THUMB (L3+R3)
+    // Human-readable labels of the above (the raw .ini strings), for the
+    // overlay's hotkey-hint footer.
+    std::string open_key_label = "Insert";
+    std::string open_pad_label = "L3+R3";
 
     bool save_requested = false;           // overlay asked to persist to the .ini
 
     bool show_descriptions = true;
     int  sort_mode = 0; // 0 = Talisman ID, 1 = Name, 2 = Group (in-game order)
+
+    // True when the loaded regulation has talismans beyond the baked base-game
+    // set (an overhaul is active). Drives whether the overlay shows the
+    // Base/Mod-Added tabs at all.
+    bool has_mod_added = false;
 
     // SpEffect ids active on the player from a source OTHER than this mod
     // (i.e. an actually-equipped talisman). Published by the worker loop each
