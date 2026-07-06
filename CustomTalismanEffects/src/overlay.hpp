@@ -1,16 +1,18 @@
 #pragma once
 
-// In-game config overlay: Dear ImGui drawn into Elden Ring's own DX12 swapchain.
+// In-game config overlay: Dear ImGui drawn in its OWN transparent top-most window
+// (D3D11 + DirectComposition) on its own thread -- it does NOT touch the game's
+// swapchain, so it coexists with other overlay mods / frame-gen / Special K.
 // Opens with the configured key (default Insert) or gamepad combo (default L3+R3),
 // lets the player toggle talisman effects live, and enforces the family
-// exclusivity / stacking rules. Ported/trimmed from ERR-MapForGoblins-DLL.
+// exclusivity / stacking rules.
 
 namespace cte::overlay {
 
-// Capture the DXGI swapchain + D3D12 command-queue vtables (via a throwaway
-// device/swapchain) and QUEUE MinHook hooks on Present / ResizeBuffers /
-// ExecuteCommandLists (+ raw input + XInput). The hooks are committed by
-// cte::hooks::apply(). Safe no-op (logs) if D3D12 init fails. Call before apply().
+// Queue MinHook hooks on the input APIs (GetRawInputData / SetCursorPos /
+// ClipCursor / XInputGetState) and spawn the dedicated overlay thread that owns
+// the window + D3D11 + DirectComposition + ImGui. The hooks are committed by
+// cte::hooks::apply(). Call before apply().
 void setup();
 
 } // namespace cte::overlay

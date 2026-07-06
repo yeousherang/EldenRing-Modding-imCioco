@@ -41,12 +41,14 @@ add_library(${PROJECT_NAME} SHARED
     src/hooks.cpp
     src/overlay.cpp
     src/messages.cpp
-    # Dear ImGui core + DX12/Win32 backends compiled into the DLL.
+    # Dear ImGui core + DX11/Win32 backends compiled into the DLL. The overlay
+    # renders in its OWN window (D3D11 + DirectComposition), not the game's DX12
+    # swapchain, so it never fights other overlay mods / frame-gen / Special K.
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
 )
 
@@ -62,7 +64,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_compile_definitions(${PROJECT_NAME} PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 
-# Static-link libER + MinHook -> a single self-contained DLL.
-target_link_libraries(${PROJECT_NAME} PRIVATE libER_static minhook d3d12 dxgi)
+# Static-link libER + MinHook -> a single self-contained DLL. The overlay uses
+# D3D11 + DXGI + DirectComposition (own window), not D3D12.
+target_link_libraries(${PROJECT_NAME} PRIVATE libER_static minhook d3d11 dxgi dcomp)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "CustomTalismanEffects")
