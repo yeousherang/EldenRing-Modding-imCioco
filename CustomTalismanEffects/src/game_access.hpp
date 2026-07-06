@@ -20,4 +20,14 @@ uintptr_t get_player_ins();
 //   slot + 0x30 (ptr)   -> next slot
 void enumerate_speffects(uintptr_t player, std::vector<int>& out);
 
+// Resolve PlayerGameData via the GameDataMan global. Returns 0 if unavailable
+// (GameDataMan AOB unresolved, or not yet in a game).
+uintptr_t get_player_game_data();
+
+// Collect the EquipParamAccessory ids of the talismans the player currently
+// POSSESSES (walking the normal-item inventory; equipped talismans still count).
+// Returns false on any bad read so the caller can keep its previous set rather
+// than wrongly clearing it; on success `out` is the possessed accessory-id list.
+bool enumerate_inventory_accessories(std::vector<int>& out);
+
 } // namespace cte

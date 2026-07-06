@@ -50,4 +50,35 @@ extern RemoveSpEffect_t g_remove;
 constexpr const char* kRemoveSpEffectAob =
     "48 83 EC 28 8B C2 48 8B 51 08 48 85 D2 ?? ?? 90";
 
+// ---- inventory possession (for Progression Mode) -----------------------
+// GameDataMan singleton, resolved by AOB (the `mov rax,[rip+gdm]` lands at the
+// match; the global pointer var = rip-relative @ off 3, len 7). Then walk the
+// player's normal-item inventory and keep the accessory (== talisman) entries.
+//   GameDataMan      + 0x08  -> PlayerGameData
+//   PlayerGameData   + 0x5D0 -> EquipInventoryData (the item bag)
+//   EquipInventoryData+ 0x0C -> NormalInventory (inline InventoryItemList, 16 bytes)
+//       list + 0x00 = capacity (u32), + 0x04 = entry-array ptr, + 0x0C = live count (u32)
+//   entry stride 0x18; entry + 0x04 = ItemID (i32) = (category << 28) | paramId
+// Accessory category == 0x20000000; paramId (low 28 bits) == EquipParamAccessory row id.
+// Source: Nordgaren/Erd-Tools (Offsets.cs, EquipInventoryData/InventoryItemList/
+// InventoryEntry/Item.cs); GameDataman+0x08 cross-checked against PersistentBuffs.
+// SEED + VERIFY in-game (debug_console = 1) before trusting -- offsets drift across patches.
+constexpr const char* kGameDataManAob =
+    "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 05 48 8B 40 58 C3 C3";
+constexpr uintptr_t kPlayerGameDataOffset     = 0x08;
+constexpr uintptr_t kEquipInventoryDataOffset = 0x5D0;
+constexpr uintptr_t kNormalInventoryOffset    = 0x0C;
+constexpr uintptr_t kInvListCapOffset     = 0x00; // within InventoryItemList
+constexpr uintptr_t kInvListPointerOffset = 0x04;
+constexpr uintptr_t kInvListEntriesOffset = 0x0C;
+constexpr uintptr_t kInvEntryStride       = 0x18;
+constexpr uintptr_t kInvEntryItemIdOffset = 0x04;
+constexpr uint32_t  kItemCategoryMask  = 0xF0000000u;
+constexpr uint32_t  kItemParamIdMask   = 0x0FFFFFFFu;
+constexpr uint32_t  kCategoryAccessory = 0x20000000u;
+constexpr int       kInvMaxEntriesGuard = 4096; // sanity cap on the slot walk
+// Address of the GameDataMan global pointer (resolved at startup; 0 == unresolved,
+// Progression Mode then safely no-ops). Defined in offsets.cpp.
+extern uintptr_t g_gamedataman_var;
+
 } // namespace cte

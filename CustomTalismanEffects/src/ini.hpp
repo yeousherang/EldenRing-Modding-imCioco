@@ -78,6 +78,15 @@ public:
         return out;
     }
 
+    // True if the section contains the key (present but empty still counts).
+    // Use this (not get_string's empty default) to detect a MISSING option when
+    // migrating an old .ini, since a present-but-blank key also yields "".
+    bool has(const std::string& sec, const std::string& key) const {
+        const auto si = data_.find(sec);
+        if (si == data_.end()) return false;
+        return si->second.find(key) != si->second.end();
+    }
+
     static bool as_bool(const std::string& v, bool def = false) {
         const std::string l = lower(v);
         if (l.empty()) return def;

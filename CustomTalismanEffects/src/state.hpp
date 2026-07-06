@@ -29,6 +29,16 @@ struct State {
 
     bool allow_stacking = false;           // ignore talisman families when set
 
+    // Progression Mode: only display + apply talismans the player currently
+    // owns in their inventory, so the usable pool grows as they find talismans.
+    bool progression_mode = false;
+    // Accessory ids the player currently possesses (refreshed by the worker loop
+    // while progression_mode is on). `possessed_valid` stays false until the
+    // first good inventory read, so the gate "fails open" -- if GameDataMan is
+    // unresolved or the bag hasn't been read, nothing is hidden/suppressed.
+    std::unordered_set<int> possessed_accessories;
+    bool possessed_valid = false;
+
     // Overlay open/close inputs (configurable in the .ini).
     unsigned int   open_vk       = 0x2D;   // VK_INSERT
     unsigned short open_pad_mask = 0x00C0; // XINPUT LEFT_THUMB | RIGHT_THUMB (L3+R3)

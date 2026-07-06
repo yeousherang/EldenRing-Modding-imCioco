@@ -129,6 +129,7 @@ unsigned short parse_pad_mask(const std::string& raw, unsigned short def) {
 struct IniConfig {
     std::unordered_set<std::string> enabled; // normalized talisman names set to 1
     bool           allow_stacking = false;
+    bool           progression_mode = false;
     unsigned int   open_vk = VK_INSERT;
     unsigned short open_pad_mask = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
     std::string    open_key_label = "Insert"; // raw .ini strings, for the overlay footer
@@ -140,6 +141,7 @@ struct IniConfig {
 IniConfig load_config(const Ini& ini) {
     IniConfig c;
     c.allow_stacking = ini.get_bool("overlay", "allow_stacking", false);
+    c.progression_mode = ini.get_bool("overlay", "progression_mode", false);
     c.open_key_label = ini.get_string("overlay", "toggle_key", "Insert");
     c.open_pad_label = ini.get_string("overlay", "toggle_gamepad_combo", "L3+R3");
     c.open_vk = parse_open_key(c.open_key_label, VK_INSERT);
@@ -165,6 +167,12 @@ const std::unordered_map<int, const TalismanEntry*>& baked_by_id() {
     return m;
 }
 
+// EquipParamAccessory rows to never surface: cut / unused content that isn't
+// obtainable in-game. 6100 "Entwining Umbilical Cord" is a cut duplicate whose
+// live name resolves to a broken "[ERROR]..." string (and, being unmatched to the
+// real .ini entry, otherwise gets re-appended on every save).
+const std::unordered_set<int> kBlacklistedAccessories = { 6100 };
+
 // After params load, build the shared talisman model by walking EVERY row of the
 // live EquipParamAccessory -- so mod-added talismans are picked up automatically,
 // not just the baked base-game set. For each row we read accessoryGroup +
@@ -185,6 +193,7 @@ void build_state(const IniConfig& cfg) {
 
     std::lock_guard<std::mutex> lk(g_state_mutex);
     g_state.allow_stacking = cfg.allow_stacking;
+    g_state.progression_mode = cfg.progression_mode;
     g_state.open_vk = cfg.open_vk;
     g_state.open_pad_mask = cfg.open_pad_mask;
     g_state.open_key_label = cfg.open_key_label;
@@ -211,6 +220,7 @@ void build_state(const IniConfig& cfg) {
     for (auto [pid, row] : from::param::EquipParamAccessory) {
         Talisman t;
         t.accessory_id = static_cast<int>(pid);
+        if (kBlacklistedAccessories.count(t.accessory_id)) continue; // cut content
         t.group = row.accessoryGroup;
         t.sort_id = row.sortId;
 
@@ -237,6 +247,13 @@ void build_state(const IniConfig& cfg) {
         if (live) t.name = messages::accessory_name(t.accessory_id);
         if (t.name.empty() && it != baked.end()) t.name = it->second->name;
         if (t.name.empty()) { ++noname; continue; }
+        // A live name that resolves to the game's "[ERROR]" placeholder marks a
+        // broken/cut row; drop it (a leading '[' would also be misread as a
+        // section header when written to the .ini). Prefer the baked name if any.
+        if (t.name.rfind("[ERROR]", 0) == 0) {
+            if (it != baked.end() && it->second->name[0] != '\0') t.name = it->second->name;
+            else { ++noname; continue; }
+        }
 
         // Effect: curated baked text preferred; else live AccessoryInfo/Caption.
         if (it != baked.end() && it->second->effect[0] != '\0')
@@ -289,8 +306,10 @@ void save_config() {
     std::vector<Sel> sels;
     std::unordered_map<std::string, bool> want; // normalized name -> enabled
     bool allow_stacking;
+    bool progression_mode;
     bool show_descriptions;
     int  sort_mode;
+    std::string open_key_label, open_pad_label;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
         for (const auto& t : g_state.talismans) {
@@ -298,13 +317,38 @@ void save_config() {
             want[normalize(t.name)] = t.enabled;
         }
         allow_stacking = g_state.allow_stacking;
+        progression_mode = g_state.progression_mode;
         show_descriptions = g_state.show_descriptions;
         sort_mode = g_state.sort_mode;
+        open_key_label = g_state.open_key_label;
+        open_pad_label = g_state.open_pad_label;
     }
+
+    // Every [overlay] option we manage, with its CURRENT value + a default
+    // comment. Used both to update existing lines (below) and, crucially, to
+    // APPEND any option missing from an older player's .ini so a new DLL version
+    // self-heals the file instead of the player having to replace it. Keyed by
+    // normalized key (lowercased); see normalize().
+    struct OverlayOpt { const char* key; std::string value; const char* comment; };
+    const std::vector<OverlayOpt> overlay_opts = {
+        {"toggle_key", open_key_label, "; key to open/close the in-game panel"},
+        {"toggle_gamepad_combo", open_pad_label,
+         "; controller combo to open/close (buttons joined with +, or \"none\")"},
+        {"allow_stacking", allow_stacking ? "1" : "0",
+         "; 1 = ignore talisman families (stack anything)"},
+        {"progression_mode", progression_mode ? "1" : "0",
+         "; 1 = only show/apply talismans you currently own in your inventory"},
+        {"show_descriptions", show_descriptions ? "1" : "0",
+         "; 1 = show the effect description pane at the bottom of the overlay"},
+        {"sort_mode", std::to_string(sort_mode),
+         "; overlay list order: 0 = Talisman ID, 1 = Name (A-Z), 2 = In-game menu order"},
+    };
 
     std::vector<std::string> out;
     std::unordered_set<std::string> present; // normalized [talismans] keys already in the file
+    std::unordered_set<std::string> overlay_present; // normalized [overlay] keys already in the file
     int tal_end = -1;                        // out index just after the last [talismans] entry
+    int overlay_end = -1;                    // out index just after the last [overlay] key line
     std::string line, section;
     while (std::getline(in, line)) {
         std::string trimmed = line;
@@ -334,20 +378,28 @@ void save_config() {
                     std::string nv = it->second ? "1" : "0";
                     line = key + "= " + nv + (comment.empty() ? "" : " " + comment);
                 }
-            } else if (section == "overlay" && normalize(key_trim) == "allow_stacking") {
-                std::string nv = allow_stacking ? "1" : "0";
-                line = key + "= " + nv + (comment.empty() ? "" : " " + comment);
-            } else if (section == "overlay" && normalize(key_trim) == "show_descriptions") {
-                std::string nv = show_descriptions ? "1" : "0";
-                line = key + "= " + nv + (comment.empty() ? "" : " " + comment);
-            } else if (section == "overlay" && normalize(key_trim) == "sort_mode") {
-                std::string nv = std::to_string(sort_mode);
-                line = key + "= " + nv + (comment.empty() ? "" : " " + comment);
+            } else if (section == "overlay") {
+                overlay_present.insert(normalize(key_trim));
+                if (normalize(key_trim) == "allow_stacking") {
+                    line = key + "= " + (allow_stacking ? "1" : "0") +
+                           (comment.empty() ? "" : " " + comment);
+                } else if (normalize(key_trim) == "progression_mode") {
+                    line = key + "= " + (progression_mode ? "1" : "0") +
+                           (comment.empty() ? "" : " " + comment);
+                } else if (normalize(key_trim) == "show_descriptions") {
+                    line = key + "= " + (show_descriptions ? "1" : "0") +
+                           (comment.empty() ? "" : " " + comment);
+                } else if (normalize(key_trim) == "sort_mode") {
+                    line = key + "= " + std::to_string(sort_mode) +
+                           (comment.empty() ? "" : " " + comment);
+                }
             }
         }
         out.push_back(line);
         if (section == "talismans" && eq != std::string::npos)
             tal_end = static_cast<int>(out.size()); // insert new entries after the last one
+        if (section == "overlay" && eq != std::string::npos)
+            overlay_end = static_cast<int>(out.size()); // insert missing options after the last one
     }
     in.close();
 
@@ -370,6 +422,25 @@ void save_config() {
         flog("added %zu mod-added talisman(s) to the .ini", added.size());
     }
 
+    // Self-migration: append any managed [overlay] option missing from the file
+    // (e.g. a new option shipped in a DLL update) with its current/default value,
+    // so upgrading players keep their settings and just gain the new line. Done
+    // after the talismans insert above; overlay_end < tal_end, so that insert did
+    // not shift it.
+    std::vector<std::string> new_opts;
+    for (const auto& o : overlay_opts)
+        if (!overlay_present.count(normalize(o.key)))
+            new_opts.push_back(std::string(o.key) + " = " + o.value + " " + o.comment);
+    if (!new_opts.empty()) {
+        if (overlay_end < 0 || overlay_end > static_cast<int>(out.size())) { // no [overlay] section
+            out.push_back("");
+            out.push_back("[overlay]");
+            overlay_end = static_cast<int>(out.size());
+        }
+        out.insert(out.begin() + overlay_end, new_opts.begin(), new_opts.end());
+        flog("added %zu missing [overlay] option(s) to the .ini", new_opts.size());
+    }
+
     std::ofstream of(path, std::ios::trunc);
     if (!of) { flog("[WARN] save: cannot open .ini for write"); return; }
     for (const auto& l : out) of << l << '\n';
@@ -389,6 +460,21 @@ uintptr_t resolve_fn(const char* aob, uintptr_t backset, const char* name) {
     return 0;
 }
 
+// Resolve a global POINTER VARIABLE referenced by a `mov reg,[rip+disp32]` (disp32
+// at instruction offset 3, instruction length 7). Unlike resolve_fn this returns
+// the address of the variable, not a function entry. Returns 0 if not found/unique.
+uintptr_t resolve_global_ptr(const char* aob, const char* name) {
+    bool multiple = false;
+    const uintptr_t hit = mem::aob_scan_unique(g_mod, aob, &multiple);
+    if (!hit || multiple) {
+        flog("[WARN] %s AOB %s", name, multiple ? "matched MULTIPLE sites" : "not found");
+        return 0;
+    }
+    const uintptr_t var = mem::rip_relative(hit, 3, 7);
+    flog("%s resolved: var=%p", name, reinterpret_cast<void*>(var));
+    return var;
+}
+
 // The apply/remove diff loop.
 void run_loop() {
     std::vector<int> active;
@@ -397,14 +483,38 @@ void run_loop() {
     bool warned_no_remove = false;
 
     for (;;) {
-        // Snapshot desired effects + drain a save request under the lock.
+        // Progression Mode: refresh the possessed-talisman set before diffing so
+        // the gate below reflects the current inventory. A failed read keeps the
+        // previous set (and possessed_valid), so a transient miss can't wrongly
+        // wipe out every effect.
+        bool progression = false;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mutex);
+            progression = g_state.progression_mode;
+        }
+        if (progression) {
+            std::vector<int> owned;
+            if (enumerate_inventory_accessories(owned)) {
+                std::lock_guard<std::mutex> lk(g_state_mutex);
+                g_state.possessed_accessories.clear();
+                g_state.possessed_accessories.insert(owned.begin(), owned.end());
+                g_state.possessed_valid = true;
+            }
+        }
+
+        // Snapshot desired effects + drain a save request under the lock. In
+        // Progression Mode, suppress talismans the player doesn't currently own
+        // (gate fails open until the first good inventory read).
         std::unordered_set<int> desired;
         bool do_save = false;
         {
             std::lock_guard<std::mutex> lk(g_state_mutex);
-            for (const auto& t : g_state.talismans)
-                if (t.enabled)
-                    for (int sp : t.sp_ids) desired.insert(sp);
+            const bool gate = g_state.progression_mode && g_state.possessed_valid;
+            for (const auto& t : g_state.talismans) {
+                if (!t.enabled) continue;
+                if (gate && !g_state.possessed_accessories.count(t.accessory_id)) continue;
+                for (int sp : t.sp_ids) desired.insert(sp);
+            }
             if (g_state.save_requested) { g_state.save_requested = false; do_save = true; }
         }
         if (do_save) save_config();
@@ -488,6 +598,12 @@ DWORD WINAPI run(LPVOID) {
         if (!g_apply)
             flog("[ERROR] no apply function -- talismans will NOT be applied");
 
+        // Resolve the GameDataMan global (for Progression Mode inventory reads).
+        // Optional: if it fails, Progression Mode safely no-ops (gate fails open).
+        g_gamedataman_var = resolve_global_ptr(kGameDataManAob, "GameDataMan");
+        if (!g_gamedataman_var)
+            flog("[WARN] GameDataMan unresolved -- Progression Mode disabled");
+
         // In-game overlay: capture DX12 vtables, queue hooks, commit them.
         if (hooks::init()) {
             overlay::setup();
@@ -501,6 +617,26 @@ DWORD WINAPI run(LPVOID) {
         from::CS::SoloParamRepository::wait_for_params(-1);
         flog("params ready -- building talisman model");
         build_state(cfg);
+
+        // Self-heal the .ini: if a managed [overlay] option is missing (e.g. a
+        // new option added in this DLL version), write it out now with its
+        // default so upgrading players gain the line without losing settings --
+        // even if they never open the overlay. save_config preserves everything
+        // else. Only when the .ini actually exists (else save_config warns).
+        if (loaded) {
+            static const char* kOverlayKeys[] = {
+                "toggle_key", "toggle_gamepad_combo", "allow_stacking",
+                "progression_mode", "show_descriptions", "sort_mode",
+            };
+            bool needs_migration = false;
+            for (const char* k : kOverlayKeys)
+                if (!ini.has("overlay", k)) { needs_migration = true; break; }
+            if (needs_migration) {
+                flog("migrating .ini: adding missing [overlay] option(s)");
+                save_config();
+            }
+        }
+
         flog("entering apply/remove loop");
         run_loop();
     } catch (const std::exception& e) {

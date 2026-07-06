@@ -614,29 +614,60 @@ void draw_talisman_window() {
 
     std::lock_guard<std::mutex> lk(g_state_mutex);
 
+    // Shared gold accent (matches apply_er_style()'s `gold`).
+    const ImVec4 kGold(0.80f, 0.68f, 0.40f, 1.0f);
+
+    // ── Header: emphasized title + mod-page link, set off by a separator ──
+    ImGui::SetWindowFontScale(1.15f);
+    ImGui::PushStyleColor(ImGuiCol_Text, kGold);
+    ImGui::TextUnformatted("Custom Talisman Effects");
+    ImGui::PopStyleColor();
+    ImGui::SetWindowFontScale(1.0f);
+    if (kModPageUrl[0] != '\0') {
+        // Corner link to the mod page (opens the default browser).
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 52.0f);
+        if (ImGui::SmallButton("Nexus"))
+            ShellExecuteA(nullptr, "open", kModPageUrl, nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ── Settings: the global toggles, grouped and set off from the list below ──
     bool stacking = g_state.allow_stacking;
     if (ImGui::Checkbox("Allow stacking (ignore talisman families)", &stacking)) {
         g_state.allow_stacking = stacking;
         if (!stacking) collapse_groups_locked();
     }
-    if (kModPageUrl[0] != '\0') {
-        // Small corner link to the mod page (opens the default browser).
-        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 52.0f);
-        if (ImGui::SmallButton("Nexus"))
-            ShellExecuteA(nullptr, "open", kModPageUrl, nullptr, nullptr, SW_SHOWNORMAL);
+    bool progression = g_state.progression_mode;
+    if (ImGui::Checkbox("Progression mode (owned talismans only)", &progression)) {
+        g_state.progression_mode = progression;
+        g_state.save_requested = true; // persist the toggle like the others
     }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
 
     static char filter[64] = "";
     ImGui::SetNextItemWidth(-90.0f);
-    ImGui::InputTextWithHint("##search", "search talismans...", filter, sizeof(filter));
+    ImGui::InputTextWithHint("##search", "Search talismans...", filter, sizeof(filter));
     ImGui::SameLine();
     if (ImGui::Button("Clear")) filter[0] = '\0';
 
     int on = 0;
     for (const auto& t : g_state.talismans) if (t.enabled) ++on;
-    ImGui::Text("%d enabled / %d", on, static_cast<int>(g_state.talismans.size()));
+    // Status indicator: enabled count in gold, total muted.
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(kGold, "Enabled: %d", on);
+    ImGui::SameLine(0.0f, 4.0f);
+    ImGui::TextDisabled("/ %d", static_cast<int>(g_state.talismans.size()));
     ImGui::SameLine();
-    if (ImGui::Button("Save to .ini")) g_state.save_requested = true;
+    // Save = primary action (gold-tinted). Disable all = secondary (default,
+    // only brightening on hover via the theme).
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.42f, 0.34f, 0.16f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.45f, 0.22f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.66f, 0.54f, 0.27f, 1.0f));
+    if (ImGui::Button("Save changes")) g_state.save_requested = true;
+    ImGui::PopStyleColor(3);
     ImGui::SameLine();
     if (ImGui::Button("Disable all"))
         for (auto& t : g_state.talismans) t.enabled = false;
@@ -672,6 +703,10 @@ void draw_talisman_window() {
         for (size_t i = 0; i < g_state.talismans.size(); ++i) {
             Talisman& t = g_state.talismans[i];
             if (t.is_base != base_tab) continue;
+            // Progression mode: hide talismans the player doesn't currently own
+            // (fails open until the first good inventory read).
+            if (g_state.progression_mode && g_state.possessed_valid &&
+                !g_state.possessed_accessories.count(t.accessory_id)) continue;
             if (!needle.empty() && to_lower(t.name).find(needle) == std::string::npos) continue;
             ++shown;
 
@@ -703,10 +738,14 @@ void draw_talisman_window() {
             }
             ImGui::PopID();
         }
-        if (shown == 0)
-            ImGui::TextDisabled(base_tab
-                ? "No talismans match your search."
-                : "No mod-added talismans detected in this regulation.");
+        if (shown == 0) {
+            const bool progression_empty =
+                g_state.progression_mode && g_state.possessed_valid && needle.empty();
+            ImGui::TextDisabled(
+                progression_empty ? "You haven't found any talismans yet."
+                : base_tab        ? "No talismans match your search."
+                                  : "No mod-added talismans detected in this regulation.");
+        }
     };
 
     if (g_state.has_mod_added) {
