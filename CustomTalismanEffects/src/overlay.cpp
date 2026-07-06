@@ -512,15 +512,30 @@ bool init_d3d() {
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
         // Draw our own software cursor; never touch the OS cursor image.
         io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-        const char* base_fonts[] = {"C:\\Windows\\Fonts\\segoeui.ttf",
+        const char* base_fonts[] = {"C:\\Windows\\Fonts\\malgun.ttf",
+                                    "C:\\Windows\\Fonts\\meiryo.ttc",
+                                    "C:\\Windows\\Fonts\\msgothic.ttc",
+                                    "C:\\Windows\\Fonts\\msyh.ttc",
+                                    "C:\\Windows\\Fonts\\msjh.ttc",
+                                    "C:\\Windows\\Fonts\\segoeui.ttf",
                                     "C:\\Windows\\Fonts\\arial.ttf",
                                     "C:\\Windows\\Fonts\\tahoma.ttf"};
         ImFont* base = nullptr;
-        for (const char* fp : base_fonts)
-            if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES &&
-                (base = io.Fonts->AddFontFromFileTTF(fp, 18.0f)) != nullptr)
-                break;
-        if (!base) io.Fonts->AddFontDefault();
+        for (const char* fp : base_fonts) {
+            if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES) {
+                const ImWchar* ranges = nullptr;
+                if (strstr(fp, "malgun.ttf") != nullptr) {
+                    ranges = io.Fonts->GetGlyphRangesKorean();
+                } else if (strstr(fp, "meiryo.ttc") != nullptr || strstr(fp, "msgothic.ttc") != nullptr) {
+                    ranges = io.Fonts->GetGlyphRangesJapanese();
+                } else if (strstr(fp, "msyh.ttc") != nullptr || strstr(fp, "msjh.ttc") != nullptr) {
+                    ranges = io.Fonts->GetGlyphRangesChineseFull();
+                }
+                base = io.Fonts->AddFontFromFileTTF(fp, 18.0f, nullptr, ranges);
+                if (base) break;
+            }
+        }
+        if (!base) base = io.Fonts->AddFontDefault();
         apply_er_style();
         ImGui_ImplWin32_Init(g_hwnd);
         g_context_inited = true;
