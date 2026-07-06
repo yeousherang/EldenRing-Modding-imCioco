@@ -94,7 +94,13 @@ unsigned int parse_open_key(const std::string& raw, unsigned int def) {
 }
 
 unsigned short parse_pad_mask(const std::string& raw, unsigned short def) {
-    if (normalize(raw).empty()) return def;
+    const std::string norm = normalize(raw);
+    if (norm.empty()) return def;
+    // Explicit opt-out: "none"/"off"/"disabled"/"disable" turns the gamepad combo
+    // off entirely (0 == no button can ever satisfy the combo check), instead of
+    // falling back to the default combo like an empty/unrecognized value does.
+    if (norm == "none" || norm == "off" || norm == "disabled" || norm == "disable")
+        return 0;
     unsigned short mask = 0;
     std::stringstream ss(raw);
     std::string tok;
