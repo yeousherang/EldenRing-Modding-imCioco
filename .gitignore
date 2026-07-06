@@ -5,6 +5,9 @@ desktop.ini
 # Third-party repo cloned only for reference -- not part of this project
 ERR-MapForGoblins-DLL/
 
+# Work in progress mod which is abandoned for now
+SummonTorrentEverywhere/
+
 # Build artifacts (each mod also ignores its own; these are safety nets)
 build/
 out/
