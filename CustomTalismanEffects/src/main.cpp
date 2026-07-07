@@ -447,10 +447,49 @@ void save_config() {
     flog("saved selections to .ini");
 }
 
+// SEH-guarded raw byte scan over the .text section. Another mod patching
+// code concurrently can leave torn bytes; the scan must never crash the game.
+// `data`/`data_len` are the image span; `pat`/`pat_len` the parsed pattern
+// (-1 == wildcard). POD-only so __try is legal.
+uintptr_t seh_raw_scan(const uint8_t* data, size_t data_len,
+                       const int* pat, size_t pat_len,
+                       uintptr_t base, bool* multiple) {
+    if (multiple) *multiple = false;
+    __try {
+        uintptr_t first = 0;
+        for (size_t i = 0; i + pat_len <= data_len; ++i) {
+            bool ok = true;
+            for (size_t j = 0; j < pat_len; ++j)
+                if (pat[j] != -1 && data[i + j] != pat[j]) { ok = false; break; }
+            if (!ok) continue;
+            if (!first) { first = base + i; }
+            else { if (multiple) *multiple = true; break; }
+        }
+        return first;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Parse an AOB string and run the SEH-guarded scan.
+uintptr_t safe_aob_scan(const mem::Module& m, const char* aob, bool* multiple) {
+    if (!m.base || !m.size) return 0;
+    std::vector<int> bytes;
+    std::istringstream ss(aob);
+    std::string tok;
+    while (ss >> tok) {
+        if (tok == "??" || tok == "?") bytes.push_back(-1);
+        else bytes.push_back(static_cast<int>(std::stoul(tok, nullptr, 16)));
+    }
+    if (bytes.empty()) return 0;
+    return seh_raw_scan(reinterpret_cast<const uint8_t*>(m.base), m.size,
+                        bytes.data(), bytes.size(), m.base, multiple);
+}
+
 // Resolve a game function by AOB. Returns the entry (hit - backset) or 0.
 uintptr_t resolve_fn(const char* aob, uintptr_t backset, const char* name) {
     bool multiple = false;
-    const uintptr_t hit = mem::aob_scan_unique(g_mod, aob, &multiple);
+    const uintptr_t hit = safe_aob_scan(g_mod, aob, &multiple);
     if (hit && !multiple) {
         flog("%s resolved: entry=%p", name, reinterpret_cast<void*>(hit - backset));
         return hit - backset;
@@ -465,7 +504,7 @@ uintptr_t resolve_fn(const char* aob, uintptr_t backset, const char* name) {
 // the address of the variable, not a function entry. Returns 0 if not found/unique.
 uintptr_t resolve_global_ptr(const char* aob, const char* name) {
     bool multiple = false;
-    const uintptr_t hit = mem::aob_scan_unique(g_mod, aob, &multiple);
+    const uintptr_t hit = safe_aob_scan(g_mod, aob, &multiple);
     if (!hit || multiple) {
         flog("[WARN] %s AOB %s", name, multiple ? "matched MULTIPLE sites" : "not found");
         return 0;
@@ -481,6 +520,16 @@ void run_loop() {
     std::unordered_set<int> active_set;
     std::unordered_set<int> applied;   // effects WE applied (ours to remove)
     bool warned_no_remove = false;
+
+    // Tug-of-war guard. Some mods force-remove SpEffects they consider theirs
+    // (erdGameTools strips e.g. 330600/360400 every ~150ms while those features
+    // are toggled off in ITS menu). Re-applying forever makes the buff icon
+    // flicker endlessly, so keep a leaky score per effect: +1 each tick an
+    // effect we applied (and still want) went missing, -1 each tick it
+    // survived. Past the limit we stop re-applying it for this session.
+    std::unordered_map<int, int> contested; // id -> leaky tug-of-war score
+    std::unordered_set<int> abandoned;      // ids we gave up re-applying
+    constexpr int kContestedLimit = 8;
 
     for (;;) {
         // Progression Mode: refresh the possessed-talisman set before diffing so
@@ -526,10 +575,30 @@ void run_loop() {
         active_set.clear();
         active_set.insert(active.begin(), active.end());
 
+        // Score the tug-of-war: an effect we applied and still want that is
+        // no longer on the player was removed EXTERNALLY (we only remove
+        // un-desired ones). One-off vanishes (area transitions, deaths) decay
+        // back to zero; only a mod stripping the effect faster than our poll
+        // accumulates to the limit.
+        for (int id : applied) {
+            if (!desired.count(id) || abandoned.count(id)) continue;
+            auto it = contested.find(id);
+            if (active_set.count(id)) {
+                if (it != contested.end() && --it->second <= 0) contested.erase(it);
+                continue;
+            }
+            const int score = (it == contested.end()) ? (contested[id] = 1) : ++it->second;
+            if (score >= kContestedLimit) {
+                abandoned.insert(id);
+                flog("[WARN] SpEffect %d keeps being removed by another mod -- "
+                     "giving up on re-applying it this session", id);
+            }
+        }
+
         // Apply: desired effects not currently on the player.
         if (g_apply) {
             for (int id : desired) {
-                if (active_set.count(id)) continue;
+                if (active_set.count(id) || abandoned.count(id)) continue;
                 g_apply(reinterpret_cast<void*>(player), id, 1); // unk=1 == self
                 if (applied.insert(id).second && g_log_each)
                     flog("applied SpEffect %d", id);
@@ -587,6 +656,39 @@ DWORD WINAPI run(LPVOID) {
 
     const IniConfig cfg = load_config(ini);
 
+    // Compatibility mode for mods with fragile startup phases (notably
+    // erdGameTools: it patches game code and polls half-initialized game
+    // singletons during boot -- Windows crash logs show it AV-ing in its own
+    // module around the time params load, and any timing perturbation from
+    // another mod can tip it over). When such a mod is present we (a) delay our
+    // own init so our MinHook apply / D3D device creation land after its DX12
+    // hook setup, and (b) later defer the heavy param/FMG work until the game
+    // world is loaded (see the wait below), vacating the boot window entirely.
+    // The mod loader (me3) loads DLLs in directory order, so erdGameTools may
+    // load a beat AFTER us -- a single GetModuleHandle check right at startup
+    // misses it. Poll for a short window to catch it regardless of load order.
+    const char* compat_mod = nullptr;
+    {
+        constexpr DWORD kDetectPollMs    = 250;
+        constexpr DWORD kDetectWindowMs  = 6000;  // catch a late-loading peer
+        constexpr DWORD kSettleMs        = 12000; // let its DX12 setup finish
+        constexpr const char* kCompatDlls[] = {
+            "erdGameTools.dll",
+        };
+        for (DWORD waited = 0; waited < kDetectWindowMs && !compat_mod;
+             waited += kDetectPollMs) {
+            for (const char* name : kCompatDlls)
+                if (GetModuleHandleA(name)) { compat_mod = name; break; }
+            if (!compat_mod) Sleep(kDetectPollMs);
+        }
+        if (compat_mod) {
+            flog("detected %s -- delaying init %lums so its DX12/patch setup settles",
+                 compat_mod, static_cast<unsigned long>(kSettleMs));
+            Sleep(kSettleMs);
+            flog("compatibility wait done");
+        }
+    }
+
     try {
         g_mod = mem::main_module();
 
@@ -604,7 +706,23 @@ DWORD WINAPI run(LPVOID) {
         if (!g_gamedataman_var)
             flog("[WARN] GameDataMan unresolved -- Progression Mode disabled");
 
-        // In-game overlay: capture DX12 vtables, queue hooks, commit them.
+        // Publish the .ini-configured overlay inputs/options to the shared state
+        // BEFORE the (possibly long, see compat wait below) param wait, so the
+        // custom toggle key works from the moment the overlay is up. build_state
+        // re-applies the same values later; that's harmless.
+        {
+            std::lock_guard<std::mutex> lk(g_state_mutex);
+            g_state.allow_stacking = cfg.allow_stacking;
+            g_state.progression_mode = cfg.progression_mode;
+            g_state.open_vk = cfg.open_vk;
+            g_state.open_pad_mask = cfg.open_pad_mask;
+            g_state.open_key_label = cfg.open_key_label;
+            g_state.open_pad_label = cfg.open_pad_label;
+            g_state.show_descriptions = cfg.show_descriptions;
+            g_state.sort_mode = cfg.sort_mode;
+        }
+
+        // In-game overlay: separate D3D11/DComp window + input hooks.
         if (hooks::init()) {
             overlay::setup();
             if (hooks::apply()) flog("hooks enabled");
@@ -612,9 +730,25 @@ DWORD WINAPI run(LPVOID) {
         } else {
             flog("[WARN] MinHook init failed -- overlay disabled");
         }
+        overlay::sync_open_keys(); // pick up the just-published toggle inputs
 
         flog("waiting for params...");
         from::CS::SoloParamRepository::wait_for_params(-1);
+
+        // Compat mode: "params ready" is exactly when a code-patching mod like
+        // erdGameTools starts applying its param edits and feature pokes -- the
+        // window where its startup races crash (per Windows crash logs). Rather
+        // than doing our own heavy work (full param iteration + FMG bank scan)
+        // inside that window, wait until the player actually loads into the
+        // world -- by then the other mod's boot phase is long over. Costs
+        // nothing: talisman effects only ever apply to a loaded player anyway.
+        if (compat_mod) {
+            flog("compat: deferring talisman model build until the game world loads");
+            while (!get_player_ins()) Sleep(500);
+            Sleep(2000); // give the freshly loaded world a beat to settle
+            flog("compat: world loaded -- proceeding");
+        }
+
         flog("params ready -- building talisman model");
         build_state(cfg);
         overlay::sync_open_keys(); // setup() ran before build_state(); pick up the real toggle_key/toggle_gamepad_combo now

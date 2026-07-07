@@ -534,7 +534,18 @@ bool init_d3d() {
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     scd.Scaling = DXGI_SCALING_STRETCH;
-    HRESULT hr = factory->CreateSwapChainForComposition(g_d3d_device, &scd, nullptr, &g_swapchain);
+    // erdGameTools hooks IDXGISwapChain::Present via the SHARED dxgi vtable
+    // (dummy-device vtable extraction) -- a vtable detour fires for EVERY
+    // swapchain in the process, not just the game's. If we present a DXGI
+    // swapchain, its detour runs its DX12 renderer against our D3D11
+    // composition swapchain and access-violates inside erdGameTools.dll
+    // (confirmed by Windows crash logs). When it's loaded, never create a DXGI
+    // swapchain at all: present through the layered-window path (GDI
+    // UpdateLayeredWindow), which no DXGI hook can see.
+    const bool avoid_dxgi_present = GetModuleHandleA("erdGameTools.dll") != nullptr;
+    HRESULT hr = E_FAIL;
+    if (!avoid_dxgi_present)
+        hr = factory->CreateSwapChainForComposition(g_d3d_device, &scd, nullptr, &g_swapchain);
     factory->Release();
     adapter->Release();
     if (SUCCEEDED(hr) && g_swapchain) {
@@ -562,10 +573,14 @@ bool init_d3d() {
         if (FAILED(hr) || !g_rtv)
             return false;
     } else {
-        // ── Proton/Wine path: composition swapchains are E_NOTIMPL -> layered. ──
+        // ── Layered path: Proton/Wine (composition swapchains are E_NOTIMPL)
+        //    or another mod's global DXGI Present hook must be avoided. ──
         dxgiDevice->Release();
-        flog("[overlay] composition swapchain unavailable (0x%08X); using layered fallback",
-             static_cast<unsigned>(hr));
+        if (avoid_dxgi_present)
+            flog("[overlay] erdGameTools detected -- using hook-safe layered presentation");
+        else
+            flog("[overlay] composition swapchain unavailable (0x%08X); using layered fallback",
+                 static_cast<unsigned>(hr));
         g_use_layered = true;
         recreate_window_layered();
         if (!g_hwnd) { flog("[overlay] layered window creation failed"); return false; }
@@ -948,16 +963,18 @@ void overlay_thread() {
             DispatchMessageW(&msg);
         }
 
-        int gw = 0, gh = 0;
-        cover_game_window(gw, gh);
-        if (gw > 0 && gh > 0 &&
-            (static_cast<UINT>(gw) != g_back_w || static_cast<UINT>(gh) != g_back_h))
-            seh_resize(static_cast<UINT>(gw), static_cast<UINT>(gh));
-
         poll_gamepad();
         update_menu_toggle();
 
         if (g_menu_open.load()) {
+            // Only do GPU work (resize + render + Present) while the menu is
+            // open. Keep our overlay sized to the game's client area.
+            int gw = 0, gh = 0;
+            cover_game_window(gw, gh);
+            if (gw > 0 && gh > 0 &&
+                (static_cast<UINT>(gw) != g_back_w || static_cast<UINT>(gh) != g_back_h))
+                seh_resize(static_cast<UINT>(gw), static_cast<UINT>(gh));
+
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
             feed_keyboard();
@@ -968,8 +985,15 @@ void overlay_thread() {
             ImGui::Render();
             render_frame(true);
         } else {
-            render_frame(false);
-            Sleep(16); // idle pacing while closed
+            // Menu closed -> our window is hidden, so there is nothing to show.
+            // Deliberately do NO GPU work here: no Present, no ResizeBuffers. A
+            // thread suspended mid-Present holds a driver/DXGI lock, and when
+            // another mod installs its own hooks via MinHook (which suspends
+            // EVERY thread to patch code) while needing that same lock, the
+            // game deadlocks/freezes on startup. Idling here keeps this thread
+            // safe to suspend and cuts pointless GPU churn. The first open frame
+            // re-covers + resizes before drawing, so nothing is stale.
+            Sleep(32);
         }
     }
 }

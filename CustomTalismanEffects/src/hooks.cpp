@@ -5,7 +5,8 @@
 namespace cte::hooks {
 
 bool init() {
-    return MH_Initialize() == MH_OK;
+    const MH_STATUS s = MH_Initialize();
+    return s == MH_OK || s == MH_ERROR_ALREADY_INITIALIZED;
 }
 
 bool create(void* target, void* detour, void** original) {
