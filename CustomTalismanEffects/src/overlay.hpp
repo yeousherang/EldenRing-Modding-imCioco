@@ -15,4 +15,11 @@ namespace cte::overlay {
 // cte::hooks::apply(). Call before apply().
 void setup();
 
+// Re-copy the open key / gamepad combo from g_state into the overlay's runtime
+// globals. setup() runs before params are ready (so before build_state() has
+// applied the .ini's toggle_key/toggle_gamepad_combo to g_state) -- call this
+// AFTER build_state() so the real configured combo takes effect instead of the
+// hardcoded defaults setup() saw.
+void sync_open_keys();
+
 } // namespace cte::overlay

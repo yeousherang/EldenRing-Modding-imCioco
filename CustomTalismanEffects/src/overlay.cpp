@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -135,6 +136,73 @@ bool foreground_is_ours() {
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
     return pid == GetCurrentProcessId();
+}
+
+// Build the ImGui font atlas: a Latin base font for the UI chrome, with EVERY
+// available CJK font merged on top so talisman names in any language render
+// correctly -- rather than picking a single "first found" CJK font and using
+// it for all CJK text regardless of script (the earlier approach: Malgun
+// Gothic, a Korean-only font present on nearly every Windows install, got
+// found first and was used for Simplified Chinese too, which it doesn't
+// cover -> tofu/mojibake for CN players).
+//
+// ImGui's glyph lookup is last-added-wins for codepoints that appear in more
+// than one merged range (CJK Unified Ideographs are shared by the SC/TC/JP
+// ranges, each with its own font-specific stroke shapes). We use the
+// player's Windows UI language to decide which font is merged LAST -- i.e.
+// whose glyph shapes win any overlapping codepoints -- while still merging
+// every other script first as a fallback, so text in a non-primary language
+// (a renamed talisman from a translation mod, etc.) still renders instead of
+// being skipped.
+void load_fonts(ImGuiIO& io) {
+    // Cyrillic (Russian, Bulgarian, Ukrainian, Serbian, etc.) glyphs live in the
+    // same font FILES as Latin, but AddFontFromFileTTF's default range is Basic
+    // Latin + Latin-1 only (0x0020-0x00FF) -- Cyrillic (0x0400+) is never pulled
+    // into the atlas unless explicitly requested, even though segoeui/arial/tahoma
+    // all contain those glyphs. GetGlyphRangesCyrillic() is a superset of the
+    // default Latin range, so this is a straight upgrade with no separate font.
+    const char* latin_fonts[] = {"C:\\Windows\\Fonts\\segoeui.ttf",
+                                 "C:\\Windows\\Fonts\\arial.ttf",
+                                 "C:\\Windows\\Fonts\\tahoma.ttf"};
+    ImFont* base = nullptr;
+    for (const char* fp : latin_fonts) {
+        if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES) {
+            base = io.Fonts->AddFontFromFileTTF(fp, 18.0f, nullptr, io.Fonts->GetGlyphRangesCyrillic());
+            if (base) break;
+        }
+    }
+    if (!base) base = io.Fonts->AddFontDefault();
+
+    struct CjkFont { const char* lang; const char* path; const ImWchar* ranges; };
+    const CjkFont cjk_fonts[] = {
+        {"ja", "C:\\Windows\\Fonts\\meiryo.ttc",   io.Fonts->GetGlyphRangesJapanese()},
+        {"ja", "C:\\Windows\\Fonts\\msgothic.ttc", io.Fonts->GetGlyphRangesJapanese()},
+        {"ko", "C:\\Windows\\Fonts\\malgun.ttf",   io.Fonts->GetGlyphRangesKorean()},
+        {"zh", "C:\\Windows\\Fonts\\msyh.ttc",     io.Fonts->GetGlyphRangesChineseFull()},
+        {"zh", "C:\\Windows\\Fonts\\msjh.ttc",     io.Fonts->GetGlyphRangesChineseFull()},
+    };
+
+    // Player's Windows UI language, so overlapping CJK codepoints render with
+    // the glyph shapes that language's readers actually expect (the game's
+    // own text language usually follows it).
+    const char* preferred = nullptr;
+    switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
+        case LANG_JAPANESE: preferred = "ja"; break;
+        case LANG_KOREAN:   preferred = "ko"; break;
+        case LANG_CHINESE:  preferred = "zh"; break;
+        default: break;
+    }
+
+    ImFontConfig merge_cfg;
+    merge_cfg.MergeMode = true;
+    for (const auto& f : cjk_fonts) // fallback scripts first...
+        if ((!preferred || std::strcmp(f.lang, preferred) != 0) &&
+            GetFileAttributesA(f.path) != INVALID_FILE_ATTRIBUTES)
+            io.Fonts->AddFontFromFileTTF(f.path, 18.0f, &merge_cfg, f.ranges);
+    for (const auto& f : cjk_fonts) // ...preferred script last, so it wins ties
+        if (preferred && std::strcmp(f.lang, preferred) == 0 &&
+            GetFileAttributesA(f.path) != INVALID_FILE_ATTRIBUTES)
+            io.Fonts->AddFontFromFileTTF(f.path, 18.0f, &merge_cfg, f.ranges);
 }
 
 // ── ER-flavored dark/gold theme ──
@@ -512,30 +580,7 @@ bool init_d3d() {
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
         // Draw our own software cursor; never touch the OS cursor image.
         io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-        const char* base_fonts[] = {"C:\\Windows\\Fonts\\malgun.ttf",
-                                    "C:\\Windows\\Fonts\\meiryo.ttc",
-                                    "C:\\Windows\\Fonts\\msgothic.ttc",
-                                    "C:\\Windows\\Fonts\\msyh.ttc",
-                                    "C:\\Windows\\Fonts\\msjh.ttc",
-                                    "C:\\Windows\\Fonts\\segoeui.ttf",
-                                    "C:\\Windows\\Fonts\\arial.ttf",
-                                    "C:\\Windows\\Fonts\\tahoma.ttf"};
-        ImFont* base = nullptr;
-        for (const char* fp : base_fonts) {
-            if (GetFileAttributesA(fp) != INVALID_FILE_ATTRIBUTES) {
-                const ImWchar* ranges = nullptr;
-                if (strstr(fp, "malgun.ttf") != nullptr) {
-                    ranges = io.Fonts->GetGlyphRangesKorean();
-                } else if (strstr(fp, "meiryo.ttc") != nullptr || strstr(fp, "msgothic.ttc") != nullptr) {
-                    ranges = io.Fonts->GetGlyphRangesJapanese();
-                } else if (strstr(fp, "msyh.ttc") != nullptr || strstr(fp, "msjh.ttc") != nullptr) {
-                    ranges = io.Fonts->GetGlyphRangesChineseFull();
-                }
-                base = io.Fonts->AddFontFromFileTTF(fp, 18.0f, nullptr, ranges);
-                if (base) break;
-            }
-        }
-        if (!base) base = io.Fonts->AddFontDefault();
+        load_fonts(io);
         apply_er_style();
         ImGui_ImplWin32_Init(g_hwnd);
         g_context_inited = true;
@@ -951,12 +996,14 @@ void teardown() {
 
 } // namespace
 
+void overlay::sync_open_keys() {
+    std::lock_guard<std::mutex> lk(g_state_mutex);
+    g_open_vk = g_state.open_vk;
+    g_open_pad_mask = g_state.open_pad_mask;
+}
+
 void overlay::setup() {
-    {
-        std::lock_guard<std::mutex> lk(g_state_mutex);
-        g_open_vk = g_state.open_vk;
-        g_open_pad_mask = g_state.open_pad_mask;
-    }
+    sync_open_keys();
 
     // Queue the input hooks. None of these touch the game's swapchain, so the
     // overlay is safe alongside frame-gen / Special K / other overlay mods. They

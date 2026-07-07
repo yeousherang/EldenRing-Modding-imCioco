@@ -617,6 +617,7 @@ DWORD WINAPI run(LPVOID) {
         from::CS::SoloParamRepository::wait_for_params(-1);
         flog("params ready -- building talisman model");
         build_state(cfg);
+        overlay::sync_open_keys(); // setup() ran before build_state(); pick up the real toggle_key/toggle_gamepad_combo now
 
         // Self-heal the .ini: if a managed [overlay] option is missing (e.g. a
         // new option added in this DLL version), write it out now with its
