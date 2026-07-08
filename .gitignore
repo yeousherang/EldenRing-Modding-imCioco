@@ -7,6 +7,8 @@ ERR-MapForGoblins-DLL/
 
 # Work in progress mod which is abandoned for now
 SummonTorrentEverywhere/
+NO LONGER DEVELOPED/
+QuestPath/
 
 # Build artifacts (each mod also ignores its own; these are safety nets)
 build/
