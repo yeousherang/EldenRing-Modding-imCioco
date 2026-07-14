@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace cte {
@@ -42,12 +43,32 @@ struct State {
     // Overlay open/close inputs (configurable in the .ini).
     unsigned int   open_vk       = 0x2D;   // VK_INSERT
     unsigned short open_pad_mask = 0x00C0; // XINPUT LEFT_THUMB | RIGHT_THUMB (L3+R3)
+    bool           open_pad_is_hold = false; // true if toggle_gamepad_combo had a HOLD_ prefix
     // Human-readable labels of the above (the raw .ini strings), for the
     // overlay's hotkey-hint footer.
     std::string open_key_label = "Insert";
     std::string open_pad_label = "L3+R3";
 
+    // Escape hatch ([overlay] focus_input = 1): restore the old focus-taking
+    // input mode. Default is focus-free -- the overlay never deactivates the
+    // game, avoiding frame-gen re-init freezes on open/close.
+    bool focus_input = false;
+
     bool save_requested = false;           // overlay asked to persist to the .ini
+
+    // ── per-character presets (session_store) ──
+    // Set by the worker when a character with no saved preset loads while OTHER
+    // characters already have presets: the overlay shows an inline import banner
+    // and the talismans default to all-off until the player resolves it.
+    bool import_prompt_active = false;
+    // Candidate characters to import from: (section key, display name). Filled by
+    // the worker alongside import_prompt_active; read by the overlay's banner.
+    std::vector<std::pair<std::string, std::string>> import_candidates;
+    // Banner -> worker request: copy this character's preset into g_state, then
+    // save it under the CURRENT character. Empty key + import_requested == the
+    // banner's "Start fresh" (keep all-off; just clear the prompt + save).
+    std::string import_from_key;
+    bool import_requested = false;
 
     bool show_descriptions = true;
     int  sort_mode = 0; // 0 = Talisman ID, 1 = Name, 2 = Group (in-game order)

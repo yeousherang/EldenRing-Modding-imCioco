@@ -15,6 +15,10 @@ extern bool      g_debug; // mirror stdout to a console when true
 // Path of the DLL's `.ini` (same folder + base name).
 std::wstring config_path();
 
+// Path of the machine-written per-character presets file (same folder + base
+// name + ".state.ini"). Distinct from config_path()'s human-edited `.ini`.
+std::wstring state_path();
+
 // Append a line to logs/<DllName>.log (truncate to start a fresh log).
 void log_line(const std::string& msg, bool truncate = false);
 

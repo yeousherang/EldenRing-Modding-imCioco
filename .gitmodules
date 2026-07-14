@@ -16,3 +16,9 @@
 [submodule "CustomTalismanEffects/external/libER"]
 	path = CustomTalismanEffects/external/libER
 	url = https://github.com/Dasaav-dsv/libER
+[submodule "OmniCaster/external/libER"]
+	path = OmniCaster/external/libER
+	url = https://github.com/Dasaav-dsv/libER
+[submodule "OmniCaster/external/Paramdex"]
+	path = OmniCaster/external/Paramdex
+	url = https://github.com/soulsmods/Paramdex

@@ -67,6 +67,14 @@ constexpr const char* kGameDataManAob =
     "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 05 48 8B 40 58 C3 C3";
 constexpr uintptr_t kPlayerGameDataOffset     = 0x08;
 constexpr uintptr_t kEquipInventoryDataOffset = 0x5D0;
+
+// PlayerGameData + this -> the character's display name (UTF-16, <=16 chars).
+// Used to key per-character presets (session_store). ⚠ UNVERIFIED (from the
+// TGA CT community RE, same value PersistentBuffs uses): verify in-game via the
+// `characters: key='<Name>_xxxx'` log line. A wrong offset yields garbage/empty
+// -> get_character_name() returns "" -> the mod falls back to the global .ini
+// (no per-character section is written), so a bad value degrades safely.
+constexpr uintptr_t kCharNameOffset = 0x9C;
 constexpr uintptr_t kNormalInventoryOffset    = 0x0C;
 constexpr uintptr_t kInvListCapOffset     = 0x00; // within InventoryItemList
 constexpr uintptr_t kInvListPointerOffset = 0x04;

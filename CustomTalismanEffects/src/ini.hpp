@@ -87,6 +87,15 @@ public:
         return si->second.find(key) != si->second.end();
     }
 
+    // Every section name present in the file (in no particular order). Used by
+    // the per-character presets store to enumerate the [char_*] sections.
+    std::vector<std::string> section_names() const {
+        std::vector<std::string> out;
+        out.reserve(data_.size());
+        for (const auto& kv : data_) out.push_back(kv.first);
+        return out;
+    }
+
     static bool as_bool(const std::string& v, bool def = false) {
         const std::string l = lower(v);
         if (l.empty()) return def;

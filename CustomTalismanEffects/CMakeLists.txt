@@ -41,6 +41,7 @@ add_library(${PROJECT_NAME} SHARED
     src/hooks.cpp
     src/overlay.cpp
     src/messages.cpp
+    src/session_store.cpp
     # Dear ImGui core + DX11/Win32 backends compiled into the DLL. The overlay
     # renders in its OWN window (D3D11 + DirectComposition), not the game's DX12
     # swapchain, so it never fights other overlay mods / frame-gen / Special K.
@@ -65,7 +66,9 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAME
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 
 # Static-link libER + MinHook -> a single self-contained DLL. The overlay uses
-# D3D11 + DXGI + DirectComposition (own window), not D3D12.
-target_link_libraries(${PROJECT_NAME} PRIVATE libER_static minhook d3d11 dxgi dcomp)
+# D3D11 + DXGI + DirectComposition (own window), not D3D12. dinput8/dxguid are
+# for the DirectInput8 pad-neutralization detours (GUID_SysKeyboard, the IIDs).
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    libER_static minhook d3d11 dxgi dcomp dinput8 dxguid)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "CustomTalismanEffects")

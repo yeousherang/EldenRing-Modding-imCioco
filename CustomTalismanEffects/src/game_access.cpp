@@ -33,6 +33,22 @@ uintptr_t get_player_game_data() {
     return mem::deref(gdm + kPlayerGameDataOffset);
 }
 
+std::wstring get_character_name() {
+    const uintptr_t pgd = get_player_game_data();
+    if (!pgd) return std::wstring();
+    struct NameRaw { wchar_t c[17]; };
+    NameRaw raw{};
+    if (!mem::safe_read(pgd + kCharNameOffset, raw)) return std::wstring();
+    std::wstring name;
+    for (int i = 0; i < 16; ++i) {
+        const wchar_t ch = raw.c[i];
+        if (ch == L'\0') break;
+        if (ch < 0x20) return std::wstring(); // control char => wrong offset / garbage
+        name.push_back(ch);
+    }
+    return name;
+}
+
 bool enumerate_inventory_accessories(std::vector<int>& out) {
     out.clear();
     const uintptr_t pgd = get_player_game_data();

@@ -9,10 +9,13 @@
 
 namespace cte::overlay {
 
-// Queue MinHook hooks on the input APIs (GetRawInputData / SetCursorPos /
-// ClipCursor / XInputGetState) and spawn the dedicated overlay thread that owns
-// the window + D3D11 + DirectComposition + ImGui. The hooks are committed by
-// cte::hooks::apply(). Call before apply().
+// Initialize MinHook, detour the gamepad APIs so the game reads a neutral pad
+// while the menu is open (dinput8 GetDeviceState/GetDeviceData now; XInput at
+// menu-open), and spawn the dedicated overlay thread that owns the window +
+// D3D11 + DirectComposition + ImGui. Keyboard/mouse are captured focus-free by
+// re-targeting the process's raw-input registration at the overlay window while
+// open -- the overlay never takes focus, so frame-gen mods don't re-init. This
+// owns the MinHook lifecycle; the worker does not need to call hooks::apply().
 void setup();
 
 // Re-copy the open key / gamepad combo from g_state into the overlay's runtime

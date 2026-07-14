@@ -39,6 +39,11 @@ std::wstring config_path() {
     return dir_of(m) + L"\\" + stem_of(m) + L".ini";
 }
 
+std::wstring state_path() {
+    const std::wstring m = module_path();
+    return dir_of(m) + L"\\" + stem_of(m) + L".state.ini";
+}
+
 void log_line(const std::string& msg, bool truncate) {
     const std::wstring path = log_path();
     CreateDirectoryW(dir_of(path).c_str(), nullptr); // ensure logs/ exists

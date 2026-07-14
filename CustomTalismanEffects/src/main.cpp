@@ -39,6 +39,7 @@
 #include "messages.hpp"
 #include "offsets.hpp"
 #include "overlay.hpp"
+#include "session_store.hpp"
 #include "state.hpp"
 #include "talisman_names.hpp"
 
@@ -125,6 +126,22 @@ unsigned short parse_pad_mask(const std::string& raw, unsigned short def) {
     return mask ? mask : def;
 }
 
+// Strips a case-insensitive "HOLD_"/"HOLD "/"HOLD-" prefix from a gamepad combo
+// string, e.g. "HOLD_R3" -> rest = "R3", returns true. The remainder still flows
+// through parse_pad_mask's own per-token normalization, so this operates on the
+// raw (un-normalized) string. A HOLD_ combo must be held ~1s to toggle the menu
+// (vs an instant tap), so an in-game combo like R3 doesn't also fire the menu.
+bool strip_hold_prefix(const std::string& raw, std::string& rest) {
+    size_t start = raw.find_first_not_of(" \t");
+    if (start == std::string::npos || raw.size() < start + 5) return false;
+    std::string head = raw.substr(start, 4);
+    for (auto& ch : head) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    char sep = raw[start + 4];
+    if (head != "hold" || (sep != '_' && sep != ' ' && sep != '-')) return false;
+    rest = raw.substr(start + 5);
+    return true;
+}
+
 // Enabled set + options parsed from the .ini (before params resolve).
 struct IniConfig {
     std::unordered_set<std::string> enabled; // normalized talisman names set to 1
@@ -132,10 +149,12 @@ struct IniConfig {
     bool           progression_mode = false;
     unsigned int   open_vk = VK_INSERT;
     unsigned short open_pad_mask = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
+    bool           open_pad_is_hold = false;
     std::string    open_key_label = "Insert"; // raw .ini strings, for the overlay footer
     std::string    open_pad_label = "L3+R3";
     bool show_descriptions = true;
     int  sort_mode = 0;
+    bool focus_input = false;
 };
 
 IniConfig load_config(const Ini& ini) {
@@ -145,10 +164,14 @@ IniConfig load_config(const Ini& ini) {
     c.open_key_label = ini.get_string("overlay", "toggle_key", "Insert");
     c.open_pad_label = ini.get_string("overlay", "toggle_gamepad_combo", "L3+R3");
     c.open_vk = parse_open_key(c.open_key_label, VK_INSERT);
-    c.open_pad_mask = parse_pad_mask(c.open_pad_label,
-                                     XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB);
+    std::string combo_rest;
+    c.open_pad_is_hold = strip_hold_prefix(c.open_pad_label, combo_rest);
+    c.open_pad_mask = parse_pad_mask(
+        c.open_pad_is_hold ? combo_rest : c.open_pad_label,
+        XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB);
     c.show_descriptions = ini.get_bool("overlay", "show_descriptions", true);
     c.sort_mode = ini.get_int("overlay", "sort_mode", 0);
+    c.focus_input = ini.get_bool("overlay", "focus_input", false);
     for (const auto& kv : ini.section_items("talismans"))
         if (Ini::as_bool(kv.second))
             c.enabled.insert(normalize(kv.first));
@@ -196,10 +219,12 @@ void build_state(const IniConfig& cfg) {
     g_state.progression_mode = cfg.progression_mode;
     g_state.open_vk = cfg.open_vk;
     g_state.open_pad_mask = cfg.open_pad_mask;
+    g_state.open_pad_is_hold = cfg.open_pad_is_hold;
     g_state.open_key_label = cfg.open_key_label;
     g_state.open_pad_label = cfg.open_pad_label;
     g_state.show_descriptions = cfg.show_descriptions;
     g_state.sort_mode = cfg.sort_mode;
+    g_state.focus_input = cfg.focus_input;
     g_state.talismans.clear();
 
     const auto& baked = baked_by_id();
@@ -291,64 +316,54 @@ void build_state(const IniConfig& cfg) {
          g_state.talismans.size(), mod_added, noeffect, noname, from_ref, from_resident);
 }
 
-// Rewrite the .ini in place: flip each [talismans] Name to the current enabled
-// state and update [overlay] allow_stacking. Preserves comments/formatting; only
-// touches the value after '='. Called when the overlay requests a save.
+// Rewrite the managed GLOBAL [overlay] option values in place (show_descriptions,
+// sort_mode -- the only ones editable from the overlay), preserving comments /
+// formatting; only touches the value after '='. Talisman selections + the
+// allow_stacking / progression_mode toggles are PER-CHARACTER now (session_store,
+// CustomTalismanEffects.state.ini) and are NOT written here -- the [talismans]
+// block + those two toggles stay as the human-authored default template / first-
+// character seed. Also self-migrates any managed [overlay] option missing from an
+// older .ini. Called (alongside presets_save) when the overlay requests a save.
 void save_config() {
     const std::wstring path = config_path();
     std::ifstream in(path);
     if (!in) { flog("[WARN] save: cannot open .ini for read"); return; }
 
-    // Snapshot selections (display name + enabled) + overlay options under the
-    // lock. Keep display names so mod-added talismans absent from the .ini can be
-    // appended as new lines below.
-    struct Sel { std::string display, norm; bool enabled; };
-    std::vector<Sel> sels;
-    std::unordered_map<std::string, bool> want; // normalized name -> enabled
-    bool allow_stacking;
-    bool progression_mode;
     bool show_descriptions;
     int  sort_mode;
     std::string open_key_label, open_pad_label;
     {
         std::lock_guard<std::mutex> lk(g_state_mutex);
-        for (const auto& t : g_state.talismans) {
-            sels.push_back({t.name, normalize(t.name), t.enabled});
-            want[normalize(t.name)] = t.enabled;
-        }
-        allow_stacking = g_state.allow_stacking;
-        progression_mode = g_state.progression_mode;
         show_descriptions = g_state.show_descriptions;
         sort_mode = g_state.sort_mode;
         open_key_label = g_state.open_key_label;
         open_pad_label = g_state.open_pad_label;
     }
 
-    // Every [overlay] option we manage, with its CURRENT value + a default
-    // comment. Used both to update existing lines (below) and, crucially, to
-    // APPEND any option missing from an older player's .ini so a new DLL version
-    // self-heals the file instead of the player having to replace it. Keyed by
-    // normalized key (lowercased); see normalize().
+    // Managed [overlay] options for self-migration (append any missing from an
+    // older .ini so a new DLL version self-heals the file). allow_stacking /
+    // progression_mode are seeded OFF here -- their live value is per-character,
+    // so they are migrate-only defaults, never value-rewritten below.
     struct OverlayOpt { const char* key; std::string value; const char* comment; };
     const std::vector<OverlayOpt> overlay_opts = {
         {"toggle_key", open_key_label, "; key to open/close the in-game panel"},
         {"toggle_gamepad_combo", open_pad_label,
-         "; controller combo to open/close (buttons joined with +, or \"none\")"},
-        {"allow_stacking", allow_stacking ? "1" : "0",
-         "; 1 = ignore talisman families (stack anything)"},
-        {"progression_mode", progression_mode ? "1" : "0",
-         "; 1 = only show/apply talismans you currently own in your inventory"},
+         "; controller combo to open/close (buttons joined with +, prefix HOLD_ to require a ~1s hold, or \"none\")"},
+        {"allow_stacking", "0",
+         "; default for NEW characters: 1 = ignore talisman families (stack anything)"},
+        {"progression_mode", "0",
+         "; default for NEW characters: 1 = only show/apply talismans you currently own"},
         {"show_descriptions", show_descriptions ? "1" : "0",
          "; 1 = show the effect description pane at the bottom of the overlay"},
         {"sort_mode", std::to_string(sort_mode),
          "; overlay list order: 0 = Talisman ID, 1 = Name (A-Z), 2 = In-game menu order"},
+        {"focus_input", "0",
+         "; 1 = legacy focus-taking input mode (only if the default focus-free capture misbehaves)"},
     };
 
     std::vector<std::string> out;
-    std::unordered_set<std::string> present; // normalized [talismans] keys already in the file
-    std::unordered_set<std::string> overlay_present; // normalized [overlay] keys already in the file
-    int tal_end = -1;                        // out index just after the last [talismans] entry
-    int overlay_end = -1;                    // out index just after the last [overlay] key line
+    std::unordered_set<std::string> overlay_present; // normalized [overlay] keys in the file
+    int overlay_end = -1;                            // out index just after the last [overlay] key line
     std::string line, section;
     while (std::getline(in, line)) {
         std::string trimmed = line;
@@ -360,73 +375,35 @@ void save_config() {
                 section = trimmed.substr(a + 1, close - a - 1);
         }
         const size_t eq = line.find('=');
-        if (eq != std::string::npos && (section == "talismans" || section == "overlay")) {
+        if (eq != std::string::npos && section == "overlay") {
             // split key / (value + optional comment)
             std::string key = line.substr(0, eq);
-            // trim key
             size_t ks = key.find_first_not_of(" \t");
             size_t ke = key.find_last_not_of(" \t");
             std::string key_trim = (ks == std::string::npos) ? "" : key.substr(ks, ke - ks + 1);
             std::string rest = line.substr(eq + 1);
             size_t hash = rest.find_first_of(";#");
             std::string comment = (hash == std::string::npos) ? "" : rest.substr(hash);
-
-            if (section == "talismans") {
-                present.insert(normalize(key_trim));
-                auto it = want.find(normalize(key_trim));
-                if (it != want.end()) {
-                    std::string nv = it->second ? "1" : "0";
-                    line = key + "= " + nv + (comment.empty() ? "" : " " + comment);
-                }
-            } else if (section == "overlay") {
-                overlay_present.insert(normalize(key_trim));
-                if (normalize(key_trim) == "allow_stacking") {
-                    line = key + "= " + (allow_stacking ? "1" : "0") +
-                           (comment.empty() ? "" : " " + comment);
-                } else if (normalize(key_trim) == "progression_mode") {
-                    line = key + "= " + (progression_mode ? "1" : "0") +
-                           (comment.empty() ? "" : " " + comment);
-                } else if (normalize(key_trim) == "show_descriptions") {
-                    line = key + "= " + (show_descriptions ? "1" : "0") +
-                           (comment.empty() ? "" : " " + comment);
-                } else if (normalize(key_trim) == "sort_mode") {
-                    line = key + "= " + std::to_string(sort_mode) +
-                           (comment.empty() ? "" : " " + comment);
-                }
+            overlay_present.insert(normalize(key_trim));
+            // Only these two are editable from the overlay; everything else
+            // (hotkeys, the per-character seed toggles) is left as authored.
+            if (normalize(key_trim) == "show_descriptions") {
+                line = key + "= " + (show_descriptions ? "1" : "0") +
+                       (comment.empty() ? "" : " " + comment);
+            } else if (normalize(key_trim) == "sort_mode") {
+                line = key + "= " + std::to_string(sort_mode) +
+                       (comment.empty() ? "" : " " + comment);
             }
         }
         out.push_back(line);
-        if (section == "talismans" && eq != std::string::npos)
-            tal_end = static_cast<int>(out.size()); // insert new entries after the last one
         if (section == "overlay" && eq != std::string::npos)
             overlay_end = static_cast<int>(out.size()); // insert missing options after the last one
     }
     in.close();
 
-    // Append talismans that aren't in the file yet (mod-added ones enabled via the
-    // overlay). Name-keyed, so two talismans sharing a normalized name collapse to
-    // one line (a known limitation of name keying) -- dedup on the normalized key.
-    std::vector<std::string> added;
-    std::unordered_set<std::string> added_norm;
-    for (const auto& s : sels) {
-        if (present.count(s.norm) || !added_norm.insert(s.norm).second) continue;
-        added.push_back(s.display + " = " + (s.enabled ? "1" : "0"));
-    }
-    if (!added.empty()) {
-        if (tal_end < 0 || tal_end > static_cast<int>(out.size())) { // no [talismans] section found
-            out.push_back("");
-            out.push_back("[talismans]");
-            tal_end = static_cast<int>(out.size());
-        }
-        out.insert(out.begin() + tal_end, added.begin(), added.end());
-        flog("added %zu mod-added talisman(s) to the .ini", added.size());
-    }
-
     // Self-migration: append any managed [overlay] option missing from the file
     // (e.g. a new option shipped in a DLL update) with its current/default value,
-    // so upgrading players keep their settings and just gain the new line. Done
-    // after the talismans insert above; overlay_end < tal_end, so that insert did
-    // not shift it.
+    // so upgrading players keep their settings and just gain the new line.
     std::vector<std::string> new_opts;
     for (const auto& o : overlay_opts)
         if (!overlay_present.count(normalize(o.key)))
@@ -444,7 +421,7 @@ void save_config() {
     std::ofstream of(path, std::ios::trunc);
     if (!of) { flog("[WARN] save: cannot open .ini for write"); return; }
     for (const auto& l : out) of << l << '\n';
-    flog("saved selections to .ini");
+    flog("saved overlay options to .ini");
 }
 
 // SEH-guarded raw byte scan over the .text section. Another mod patching
@@ -514,12 +491,46 @@ uintptr_t resolve_global_ptr(const char* aob, const char* name) {
     return var;
 }
 
+// Called when the resolved character key changes (including the first load of a
+// session). Applies that character's preset: load an existing one; seed the very
+// first character ever from the current .ini selections; or, for a later new
+// character, blank the selections and raise the import prompt.
+void on_character_changed(const std::string& key, const std::wstring& name) {
+    std::lock_guard<std::mutex> lk(g_state_mutex);
+    if (presets_has(key)) {
+        presets_load_into(key);
+        g_state.import_prompt_active = false;
+        g_state.import_candidates.clear();
+        flog("presets: character '%s' -- loaded saved preset", key.c_str());
+    } else if (presets_any()) {
+        presets_clear_state(); // all off; the player picks via the import banner
+        g_state.import_prompt_active = true;
+        g_state.import_candidates = presets_list();
+        flog("presets: character '%s' -- no preset; import prompt (%zu candidate(s))",
+             key.c_str(), g_state.import_candidates.size());
+    } else {
+        // Very first character ever: adopt the current .ini selections as its
+        // preset and persist now, so the NEXT character sees a non-empty store.
+        presets_save(key, name);
+        g_state.import_prompt_active = false;
+        g_state.import_candidates.clear();
+        flog("presets: character '%s' -- first character; seeded from .ini", key.c_str());
+    }
+}
+
 // The apply/remove diff loop.
 void run_loop() {
     std::vector<int> active;
     std::unordered_set<int> active_set;
     std::unordered_set<int> applied;   // effects WE applied (ours to remove)
     bool warned_no_remove = false;
+
+    // Per-character preset tracking. last_char_key is the currently-loaded
+    // character's key (empty = none resolved yet / name-read failed); last_char_name
+    // is its raw display name (for saves). A failed name read keeps the previous
+    // key so a transient bad read never looks like a character switch.
+    std::string  last_char_key;
+    std::wstring last_char_name;
 
     // Tug-of-war guard. Some mods force-remove SpEffects they consider theirs
     // (erdGameTools strips e.g. 330600/360400 every ~150ms while those features
@@ -532,6 +543,22 @@ void run_loop() {
     constexpr int kContestedLimit = 8;
 
     for (;;) {
+        // ── per-character presets: detect a character load / switch ──
+        // get_character_name() returns "" at the main menu / on a failed read, so
+        // this only fires once a character is actually loaded. On a real key change
+        // (incl. the first load) we load/seed the preset or raise the import prompt.
+        {
+            const std::wstring name = get_character_name();
+            const bool name_ok = !name.empty();
+            const std::string key = name_ok ? char_key(name) : last_char_key;
+            if (name_ok && key != last_char_key) {
+                flog("characters: key='%s' (character loaded)", key.c_str());
+                on_character_changed(key, name);
+                last_char_key = key;
+                last_char_name = name;
+            }
+        }
+
         // Progression Mode: refresh the possessed-talisman set before diffing so
         // the gate below reflects the current inventory. A failed read keeps the
         // previous set (and possessed_valid), so a transient miss can't wrongly
@@ -551,11 +578,13 @@ void run_loop() {
             }
         }
 
-        // Snapshot desired effects + drain a save request under the lock. In
+        // Snapshot desired effects + drain save/import requests under the lock. In
         // Progression Mode, suppress talismans the player doesn't currently own
         // (gate fails open until the first good inventory read).
         std::unordered_set<int> desired;
         bool do_save = false;
+        bool do_import = false;
+        std::string import_src;
         {
             std::lock_guard<std::mutex> lk(g_state_mutex);
             const bool gate = g_state.progression_mode && g_state.possessed_valid;
@@ -565,8 +594,58 @@ void run_loop() {
                 for (int sp : t.sp_ids) desired.insert(sp);
             }
             if (g_state.save_requested) { g_state.save_requested = false; do_save = true; }
+            if (g_state.import_requested) {
+                g_state.import_requested = false;
+                do_import = true;
+                import_src = g_state.import_from_key;
+                g_state.import_from_key.clear();
+            }
         }
-        if (do_save) save_config();
+
+        // Import banner resolution ("Import from X" / "Start fresh"): apply the
+        // chosen preset (empty src == start fresh, keep the all-off state) and
+        // persist it as THIS character's preset so the prompt doesn't recur.
+        if (do_import) {
+            std::lock_guard<std::mutex> lk(g_state_mutex);
+            const bool imported = !import_src.empty() && presets_import_into(import_src);
+            g_state.import_prompt_active = false;
+            g_state.import_candidates.clear();
+            presets_save(last_char_key, last_char_name);
+            if (imported)
+                flog("presets: imported '%s' into character '%s'",
+                     import_src.c_str(), last_char_key.c_str());
+            else
+                flog("presets: character '%s' started fresh", last_char_key.c_str());
+            // Re-snapshot desired now that selections changed, so the import
+            // takes effect this tick instead of next.
+            desired.clear();
+            const bool gate = g_state.progression_mode && g_state.possessed_valid;
+            for (const auto& t : g_state.talismans) {
+                if (!t.enabled) continue;
+                if (gate && !g_state.possessed_accessories.count(t.accessory_id)) continue;
+                for (int sp : t.sp_ids) desired.insert(sp);
+            }
+        }
+
+        // Save request (Save button / progression toggle / menu close): persist
+        // this character's preset (enabled ids + the two toggles) + the global
+        // [overlay] options.
+        if (do_save) {
+            {
+                std::lock_guard<std::mutex> lk(g_state_mutex);
+                bool any_on = false;
+                for (const auto& t : g_state.talismans) if (t.enabled) { any_on = true; break; }
+                // Don't commit an all-off section for a character still showing the
+                // import prompt (the menu was closed without choosing) -- let the
+                // prompt recur next load. Any enabled talisman commits + resolves it.
+                if (!(g_state.import_prompt_active && !any_on)) {
+                    presets_save(last_char_key, last_char_name);
+                    g_state.import_prompt_active = false;
+                    g_state.import_candidates.clear();
+                }
+            }
+            save_config(); // global [overlay] options (locks g_state itself)
+        }
 
         const uintptr_t player = get_player_ins();
         if (!player) { Sleep(kPollMs); continue; }
@@ -704,7 +783,12 @@ DWORD WINAPI run(LPVOID) {
         // Optional: if it fails, Progression Mode safely no-ops (gate fails open).
         g_gamedataman_var = resolve_global_ptr(kGameDataManAob, "GameDataMan");
         if (!g_gamedataman_var)
-            flog("[WARN] GameDataMan unresolved -- Progression Mode disabled");
+            flog("[WARN] GameDataMan unresolved -- Progression Mode + per-character presets disabled");
+
+        // Load the per-character presets file into memory (worker-thread mirror).
+        // GameDataMan is what get_character_name() reads through; without it the
+        // key can't resolve and the mod stays on the global .ini selections.
+        presets_startup_load();
 
         // Publish the .ini-configured overlay inputs/options to the shared state
         // BEFORE the (possibly long, see compat wait below) param wait, so the
@@ -716,20 +800,20 @@ DWORD WINAPI run(LPVOID) {
             g_state.progression_mode = cfg.progression_mode;
             g_state.open_vk = cfg.open_vk;
             g_state.open_pad_mask = cfg.open_pad_mask;
+            g_state.open_pad_is_hold = cfg.open_pad_is_hold;
             g_state.open_key_label = cfg.open_key_label;
             g_state.open_pad_label = cfg.open_pad_label;
             g_state.show_descriptions = cfg.show_descriptions;
             g_state.sort_mode = cfg.sort_mode;
+            g_state.focus_input = cfg.focus_input;
         }
 
-        // In-game overlay: separate D3D11/DComp window + input hooks.
-        if (hooks::init()) {
-            overlay::setup();
-            if (hooks::apply()) flog("hooks enabled");
-            else                flog("[WARN] MH_ApplyQueued failed -- overlay disabled");
-        } else {
-            flog("[WARN] MinHook init failed -- overlay disabled");
-        }
+        // In-game overlay: separate D3D11/DComp window + focus-free input.
+        // overlay::setup() owns the MinHook lifecycle (MH_Initialize + the
+        // dinput8 GetDeviceState/GetDeviceData detours; the XInput detours are
+        // installed lazily on the first menu-open). No hooks touch the game's
+        // swapchain, so this is safe alongside frame-gen / Special K / erdGameTools.
+        overlay::setup();
         overlay::sync_open_keys(); // pick up the just-published toggle inputs
 
         flog("waiting for params...");
@@ -761,7 +845,7 @@ DWORD WINAPI run(LPVOID) {
         if (loaded) {
             static const char* kOverlayKeys[] = {
                 "toggle_key", "toggle_gamepad_combo", "allow_stacking",
-                "progression_mode", "show_descriptions", "sort_mode",
+                "progression_mode", "show_descriptions", "sort_mode", "focus_input",
             };
             bool needs_migration = false;
             for (const char* k : kOverlayKeys)
