@@ -9,20 +9,26 @@
 // with those tools, and that shared state getting corrupted crashed the game.
 //
 // Architecture:
-//   - setup() queues the input hooks and spawns a detached overlay thread that
-//     creates the window + D3D11 + DComp + ImGui DX11 backend and runs the render
-//     loop. setup() returns fast; the thread owns all overlay state.
-//   - Window: WS_POPUP + WS_EX_NOREDIRECTIONBITMAP|TOPMOST|NOACTIVATE|TOOLWINDOW;
-//     transparency via DirectComposition (premultiplied alpha). Shown only while
-//     the menu is open, hidden when closed (a hidden window touches no input).
+//   - setup() resolves + detours XInputGetState (pad neutralization, see the
+//     input section) and spawns a detached overlay thread that creates the
+//     window + D3D11 + DComp + ImGui DX11 backend and runs the render loop.
+//     setup() returns fast; the thread owns all overlay state.
+//   - Window: WS_POPUP + WS_EX_NOREDIRECTIONBITMAP|TOPMOST|TOOLWINDOW|NOACTIVATE;
+//     transparency via DirectComposition (premultiplied alpha). Kept SHOWN for
+//     the mod's lifetime and NEVER activated: hiding it uncovers the game (a DWM
+//     present-mode transition), and taking focus deactivates the game -- which
+//     makes frame-gen mods (erdGameTools / Smooth Motion) tear down and re-init
+//     for several seconds, the classic ER "alt-tab freeze". Both open and close
+//     must change NOTHING the game's presentation or activation state can see.
+//     Closed = one fully-transparent frame + WS_EX_TRANSPARENT (click-through).
 //   - Each iteration the window is moved to exactly cover the game's client area.
-//   - Open/close (Insert / L3+R3) + Esc/B are polled with GetAsyncKeyState. We do
-//     NOT steal the game's focus.
-//   - Mouse comes to our own window (WM_MOUSE -> ImGui_ImplWin32_WndProcHandler);
-//     the SetCursorPos/ClipCursor hooks free the OS cursor while the menu is open so
-//     it can reach our window. Keyboard (incl. typed text for the search box) is
-//     captured from the game's GetRawInputData and fed to ImGui; the same hook
-//     neutralizes the game's keyboard/mouse so menu input never leaks into gameplay.
+//   - Open/close (default Insert / L3+R3) + Esc/B are polled with GetAsyncKeyState.
+//   - While the menu is open, keyboard + mouse are captured focus-free by
+//     re-targeting the process's raw-input registration at our window (which
+//     also starves the game's raw-input reader, so menu input never leaks into
+//     gameplay); the mouse is a virtual cursor integrated from raw deltas; the
+//     game's registration is restored on close. Gamepad: XInput + DirectInput8
+//     detours hand the game neutral pad input while the menu is open.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -32,14 +38,19 @@
 #include <dxgi1_3.h>
 #include <dcomp.h>
 #include <Xinput.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <imgui.h>
@@ -55,6 +66,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dcomp.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dxguid.lib") // IID_IDirectInput8W/A, GUID_SysKeyboard
 
 // From imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
@@ -69,20 +81,19 @@ constexpr const char* kModPageUrl = "https://www.nexusmods.com/eldenring/mods/10
 
 const wchar_t* kOverlayClass = L"CTE_OverlayWindow";
 
-using GetRawInputData_t = UINT(WINAPI*)(HRAWINPUT, UINT, LPVOID, PUINT, UINT);
-using SetCursorPos_t     = BOOL(WINAPI*)(int, int);
-using ClipCursor_t       = BOOL(WINAPI*)(const RECT*);
-using XInputGetState_t   = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
-
-GetRawInputData_t oGetRawInputData = nullptr;
-SetCursorPos_t    oSetCursorPos = nullptr;
-ClipCursor_t      oClipCursor = nullptr;
-XInputGetState_t  oXInputGetState = nullptr; // trampoline: OUR poll reads the real pad
-XInputGetState_t  pXInputGetState = nullptr; // raw proc, in case the hook never applied
+using XInputGetState_t = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+XInputGetState_t pXInputGetState = nullptr; // real pad reader (MinHook trampoline,
+                                            // or the direct proc if hooking failed)
 
 // Open/close inputs, snapshotted from g_state at setup().
 unsigned int   g_open_vk = 0x2D;         // VK_INSERT
 unsigned short g_open_pad_mask = 0x00C0; // L3+R3
+bool g_open_pad_is_hold = false;         // true if the combo needs a hold, not a tap
+constexpr long long kPadHoldMs = 1000;   // hardcoded hold duration for HOLD_ combos
+// Escape hatch ([overlay] focus_input = 1): restore the old focus-taking input
+// mode for setups where the focus-free capture misbehaves. Costs the alt-tab
+// freeze on close when frame-gen mods are active. Snapshotted at setup().
+bool g_focus_input = false;
 
 // ── window + D3D11 + DirectComposition state (overlay thread only) ──
 HWND g_hwnd = nullptr;      // our overlay window
@@ -117,14 +128,9 @@ bool g_d3d_inited = false;            // D3D11 + DComp + dx11 backend
 XINPUT_GAMEPAD g_pad{};
 bool  g_pad_ok = false;
 
-// ── keyboard capture (game message thread writes; render thread drains) ──
-// The overlay window never holds focus, so it gets no WM_KEYDOWN/WM_CHAR. We hook
-// the game's GetRawInputData instead: key events + synthesized characters (so the
-// search box works) are queued here and drained into ImGui on the render thread.
-struct KeyEv { ImGuiKey key; bool down; };
-std::mutex           g_key_mtx;
-std::vector<KeyEv>   g_key_events;   // guarded by g_key_mtx
-std::vector<wchar_t> g_char_events;  // guarded by g_key_mtx
+// Keyboard + mouse now arrive via our window's raw-input capture (re-targeted
+// while the menu is open); raw keys are forwarded to the ImGui Win32 backend and
+// the mouse is a virtual cursor, so no separate capture buffers are needed.
 
 inline bool kd(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
@@ -250,110 +256,38 @@ void apply_er_style() {
     c[ImGuiCol_TextSelectedBg] = ImVec4(0.55f, 0.44f, 0.22f, 0.5f);
 }
 
-// ── input mapping / hooks ──
-ImGuiKey vk_to_imgui(USHORT vk) {
-    if (vk >= 'A' && vk <= 'Z') return static_cast<ImGuiKey>(ImGuiKey_A + (vk - 'A'));
-    if (vk >= '0' && vk <= '9') return static_cast<ImGuiKey>(ImGuiKey_0 + (vk - '0'));
-    switch (vk) {
-    case VK_CONTROL: case VK_LCONTROL: return ImGuiKey_LeftCtrl;
-    case VK_RCONTROL: return ImGuiKey_RightCtrl;
-    case VK_SHIFT: case VK_LSHIFT: return ImGuiKey_LeftShift;
-    case VK_RSHIFT: return ImGuiKey_RightShift;
-    case VK_LEFT: return ImGuiKey_LeftArrow;
-    case VK_RIGHT: return ImGuiKey_RightArrow;
-    case VK_UP: return ImGuiKey_UpArrow;
-    case VK_DOWN: return ImGuiKey_DownArrow;
-    case VK_HOME: return ImGuiKey_Home;
-    case VK_END: return ImGuiKey_End;
-    case VK_PRIOR: return ImGuiKey_PageUp;
-    case VK_NEXT: return ImGuiKey_PageDown;
-    case VK_DELETE: return ImGuiKey_Delete;
-    case VK_BACK: return ImGuiKey_Backspace;
-    case VK_RETURN: return ImGuiKey_Enter;
-    case VK_TAB: return ImGuiKey_Tab;
-    case VK_SPACE: return ImGuiKey_Space;
-    case VK_ESCAPE: return ImGuiKey_Escape;
-    default: return ImGuiKey_None;
-    }
-}
+// ── input (focus-free) ──
+// The game must NEVER lose foreground activation: frame-generation mods
+// (erdGameTools / NVIDIA Smooth Motion) tear their pipeline down and re-init
+// it whenever the game window is deactivated OR reactivated -- a multi-second
+// frozen-frame stall (a plain alt-tab reproduces it with the mod unloaded).
+// The overlay window is therefore permanently WS_EX_NOACTIVATE and we never
+// call SetForegroundWindow in either direction. While the menu is open, input
+// is captured WITHOUT focus:
+//   - Keyboard + mouse: the process's raw-input registration is re-targeted at
+//     our window (RegisterRawInputDevices is per-process, per-usage, so one
+//     call both routes WM_INPUT to us and SILENCES the game's raw-input reader
+//     -- ER reads kb/mouse via raw input, so menu input can't leak into
+//     gameplay). The game's exact registration is restored on close.
+//   - Mouse cursor: a VIRTUAL cursor integrated from raw deltas. The game,
+//     still focused, keeps hiding/clipping/warping the OS cursor; raw deltas
+//     don't care. ImGui draws it as a software cursor.
+//   - Gamepad: the still-focused game would act on pad presses, so the pad
+//     APIs are MinHook-detoured to hand the GAME neutral input while the menu
+//     is open: XInputGetState + XInputGetStateEx(#100), and -- the one ER
+//     actually uses -- IDirectInputDevice8::GetDeviceState/GetDeviceData via
+//     the shared dinput8 vtable. Our own polling reads the real state via the
+//     XInput trampoline.
+// [overlay] focus_input = 1 restores the previous focus-taking mode (see
+// g_focus_input above) as an escape hatch.
 
-// Hook the game's raw-input read. While the menu is open we (a) capture the
-// keyboard for ImGui (key events + layout-aware characters for the search box),
-// and (b) neutralize the game's keyboard+mouse payload so menu input never leaks
-// into gameplay. Runs on the game's message thread.
-UINT WINAPI hkGetRawInputData(HRAWINPUT hri, UINT cmd, LPVOID data, PUINT size, UINT hdr) {
-    UINT res = oGetRawInputData(hri, cmd, data, size, hdr);
-    if (!g_menu_open.load() || cmd != RID_INPUT || data == nullptr ||
-        res == static_cast<UINT>(-1))
-        return res;
-
-    auto* ri = reinterpret_cast<RAWINPUT*>(data);
-    if (ri->header.dwType == RIM_TYPEMOUSE) {
-        // Menu mouse comes via our window's WM_MOUSE; kill the game's copy so the
-        // camera doesn't move while the menu is open.
-        ri->data.mouse.lLastX = 0;
-        ri->data.mouse.lLastY = 0;
-        ri->data.mouse.usButtonFlags = 0;
-        ri->data.mouse.usButtonData = 0;
-        ri->data.mouse.ulRawButtons = 0;
-    } else if (ri->header.dwType == RIM_TYPEKEYBOARD) {
-        const RAWKEYBOARD& kb = ri->data.keyboard;
-        const bool down = (kb.Flags & RI_KEY_BREAK) == 0;
-        ImGuiKey k = vk_to_imgui(kb.VKey);
-        {
-            std::lock_guard<std::mutex> lk(g_key_mtx);
-            if (k != ImGuiKey_None) g_key_events.push_back({k, down});
-            if (down) {
-                BYTE ks[256];
-                if (GetKeyboardState(ks)) {
-                    wchar_t buf[4]{};
-                    const int n = ToUnicode(kb.VKey, kb.MakeCode, ks, buf, 4, 0);
-                    for (int i = 0; i < n; ++i)
-                        if (buf[i] >= 0x20 && buf[i] != 0x7F) // printable only
-                            g_char_events.push_back(buf[i]);
-                }
-            }
-        }
-        ri->data.keyboard.VKey = 0;
-        ri->data.keyboard.MakeCode = 0;
-        ri->data.keyboard.Flags = RI_KEY_BREAK; // report a no-op key-up
-        ri->data.keyboard.Message = WM_NULL;
-    }
-    return res;
-}
-
-// The game's FPS camera recenters (SetCursorPos) and confines (ClipCursor) the OS
-// cursor every frame. While the menu is open we no-op those so the cursor moves
-// freely and reaches our overlay window.
-BOOL WINAPI hkSetCursorPos(int x, int y) {
-    if (g_menu_open.load()) return TRUE;
-    return oSetCursorPos(x, y);
-}
-BOOL WINAPI hkClipCursor(const RECT* r) {
-    if (g_menu_open.load()) return oClipCursor(nullptr);
-    return oClipCursor(r);
-}
-
-// While the menu is open, feed the GAME a neutral (connected, nothing pressed) pad
-// so its buttons don't leak into gameplay. Our own poll_gamepad reads the real pad
-// through the trampoline.
-DWORD WINAPI hkXInputGetState(DWORD idx, XINPUT_STATE* st) {
-    DWORD r = oXInputGetState(idx, st);
-    if (r == ERROR_SUCCESS && st && g_menu_open.load()) {
-        const DWORD pkt = st->dwPacketNumber;
-        ZeroMemory(&st->Gamepad, sizeof(st->Gamepad));
-        st->dwPacketNumber = pkt;
-    }
-    return r;
-}
-
+// Read the real pad (through the trampoline) for ImGui nav + the open combo.
 void poll_gamepad() {
     g_pad_ok = false;
-    XInputGetState_t xget = oXInputGetState ? oXInputGetState : pXInputGetState;
-    if (!xget) return;
+    if (!pXInputGetState) return;
     for (DWORD idx = 0; idx < XUSER_MAX_COUNT; ++idx) {
         XINPUT_STATE state{};
-        if (xget(idx, &state) == ERROR_SUCCESS) {
+        if (pXInputGetState(idx, &state) == ERROR_SUCCESS) {
             g_pad = state.Gamepad;
             g_pad_ok = true;
             break;
@@ -361,14 +295,21 @@ void poll_gamepad() {
     }
 }
 
-// Drain captured keyboard events/characters into ImGui (render thread).
-void feed_keyboard() {
-    ImGuiIO& io = ImGui::GetIO();
-    std::lock_guard<std::mutex> lk(g_key_mtx);
-    for (const auto& e : g_key_events) io.AddKeyEvent(e.key, e.down);
-    g_key_events.clear();
-    for (wchar_t ch : g_char_events) io.AddInputCharacterUTF16(static_cast<ImWchar16>(ch));
-    g_char_events.clear();
+// ONLY used by the focus_input = 1 escape hatch. Robustly move foreground
+// focus to `hwnd`; same-process foreground switches still need the
+// AttachThreadInput dance or SetForegroundWindow is silently refused by the
+// foreground lock. The default mode never changes activation at all.
+void force_foreground(HWND hwnd) {
+    if (!hwnd) return;
+    const HWND fg = GetForegroundWindow();
+    const DWORD fg_tid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    const DWORD our_tid = GetCurrentThreadId();
+    if (fg_tid && fg_tid != our_tid) AttachThreadInput(fg_tid, our_tid, TRUE);
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+    SetActiveWindow(hwnd);
+    if (fg_tid && fg_tid != our_tid) AttachThreadInput(fg_tid, our_tid, FALSE);
 }
 
 // Feed the polled gamepad to ImGui nav (mouse + keyboard come in elsewhere).
@@ -376,14 +317,24 @@ void feed_gamepad() {
     if (!g_pad_ok) return;
     ImGuiIO& io = ImGui::GetIO();
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
-    const WORD nbt = g_pad.wButtons & ~g_open_pad_mask; // reserve the toggle combo
+    // Only strip the toggle-combo buttons (e.g. A+UP) from nav while that FULL
+    // combo is actually held down together -- that's the one instant we must
+    // stop it from also acting as a nav press. Stripping the bits unconditionally
+    // (the old behavior) permanently disabled plain A (confirm) and plain DPad-Up
+    // (nav) for as long as the menu stayed open, since both happen to be part of
+    // the default open combo.
+    const bool combo_held = g_open_pad_mask &&
+        (g_pad.wButtons & g_open_pad_mask) == g_open_pad_mask;
+    const WORD nbt = combo_held ? (g_pad.wButtons & ~g_open_pad_mask) : g_pad.wButtons;
     io.AddKeyEvent(ImGuiKey_GamepadDpadUp,    (nbt & XINPUT_GAMEPAD_DPAD_UP) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadDown,  (nbt & XINPUT_GAMEPAD_DPAD_DOWN) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadLeft,  (nbt & XINPUT_GAMEPAD_DPAD_LEFT) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadRight, (nbt & XINPUT_GAMEPAD_DPAD_RIGHT) != 0);
-    io.AddKeyEvent(ImGuiKey_GamepadFaceDown,  (nbt & XINPUT_GAMEPAD_A) != 0);
+    io.AddKeyEvent(ImGuiKey_GamepadFaceDown,  (nbt & XINPUT_GAMEPAD_A) != 0); // A: confirm/open
     io.AddKeyEvent(ImGuiKey_GamepadFaceRight, (nbt & XINPUT_GAMEPAD_B) != 0);
-    io.AddKeyEvent(ImGuiKey_GamepadFaceUp,    (nbt & XINPUT_GAMEPAD_Y) != 0);
+    // Y is intentionally NOT mapped to GamepadFaceUp: ImGui treats FaceUp as a
+    // second generic "activate" input alongside A, so leaving it mapped made Y
+    // toggle checkboxes too. Only A should confirm.
     io.AddKeyEvent(ImGuiKey_GamepadFaceLeft,  (nbt & XINPUT_GAMEPAD_X) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadL1,        (nbt & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadR1,        (nbt & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0);
@@ -397,21 +348,467 @@ void feed_gamepad() {
     io.AddKeyAnalogEvent(ImGuiKey_GamepadLStickDown,  ly < -DZ, ly < -DZ ? -ly : 0.0f);
 }
 
+// ── gamepad neutralization: XInput + DirectInput8 detours ──
+// The game reads a NEUTRAL pad while the menu is open. XInput alone is NOT
+// enough: with XInputGetState detoured ER still saw every pad press -- ER polls
+// controllers through DirectInput8. So we detour BOTH: XInputGetState and
+// XInputGetStateEx (ordinal 100) in every loaded xinput module, plus
+// IDirectInputDevice8::GetDeviceState/GetDeviceData via their shared vtable.
+// Do not "simplify" the dinput hooks away -- they are the ones that matter.
+
+// Up to 3 xinput modules x {named export, ordinal 100}.
+XInputGetState_t g_xi_real[6] = {}; // MinHook trampolines, filled by hook_xinput()
+
+template <int I>
+DWORD WINAPI xi_detour(DWORD idx, XINPUT_STATE* state) {
+    const DWORD r = g_xi_real[I](idx, state);
+    if (r == ERROR_SUCCESS && state && !g_focus_input &&
+        g_menu_open.load(std::memory_order_relaxed))
+        // Zero buttons/sticks/triggers; the packet number is left intact so
+        // the game's "controller connected" logic never blinks.
+        std::memset(&state->Gamepad, 0, sizeof(state->Gamepad));
+    return r;
+}
+
+// ── DirectInput8: neutralize GetDeviceState / GetDeviceData ──
+// Every device instance dinput8.dll hands out shares its vtable, so hooking
+// through our own throwaway keyboard device intercepts the game's controller
+// devices too. The A and W interfaces can carry distinct vtables -- both are
+// resolved and hooked (deduped by address).
+using DIGetDeviceState_t = HRESULT(WINAPI*)(IDirectInputDevice8W*, DWORD, LPVOID);
+using DIGetDeviceData_t  = HRESULT(WINAPI*)(IDirectInputDevice8W*, DWORD,
+                                            LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
+DIGetDeviceState_t g_di_state_real[2] = {};
+DIGetDeviceData_t  g_di_data_real[2]  = {};
+std::atomic<bool>  g_dinput_hooked{false};
+
+bool pad_blocking() {
+    return !g_focus_input && g_menu_open.load(std::memory_order_relaxed);
+}
+
+// Neutral joystick axes are NOT zero: the game configures each axis range
+// (DIPROP_RANGE) and neutral is its midpoint -- memset(0) would slam a
+// 0..65535-range stick into the top-left corner. Query once per device.
+// DIJOYSTATE(2) starts with 8 contiguous LONG axes: lX..lRz, rglSlider[0..1].
+struct JoyNeutral { LONG axis[8]; };
+std::mutex g_di_mutex;
+std::unordered_map<void*, JoyNeutral> g_joy_neutral;
+std::unordered_map<void*, std::vector<uint8_t>> g_joy_frozen; // custom formats
+
+JoyNeutral joy_neutral_for(IDirectInputDevice8W* dev) {
+    {
+        std::lock_guard<std::mutex> lk(g_di_mutex);
+        auto it = g_joy_neutral.find(dev);
+        if (it != g_joy_neutral.end()) return it->second;
+    }
+    JoyNeutral n{};
+    for (int a = 0; a < 8; ++a) {
+        DIPROPRANGE pr{};
+        pr.diph.dwSize = sizeof(DIPROPRANGE);
+        pr.diph.dwHeaderSize = sizeof(DIPROPHEADER);
+        pr.diph.dwObj = static_cast<DWORD>(a) * sizeof(LONG); // DIJOFS_X..
+        pr.diph.dwHow = DIPH_BYOFFSET;
+        // GetProperty (vtable slot 5) is unhooked -- no recursion.
+        n.axis[a] = SUCCEEDED(dev->GetProperty(DIPROP_RANGE, &pr.diph))
+                        ? (pr.lMin + pr.lMax) / 2 : 0;
+    }
+    std::lock_guard<std::mutex> lk(g_di_mutex);
+    g_joy_neutral.emplace(dev, n);
+    return n;
+}
+
+void di_neutralize_joy(IDirectInputDevice8W* dev, DWORD cb, void* data) {
+    const JoyNeutral n = joy_neutral_for(dev);
+    if (cb == sizeof(DIJOYSTATE)) {
+        auto* js = static_cast<DIJOYSTATE*>(data);
+        std::memcpy(&js->lX, n.axis, sizeof(n.axis));
+        for (auto& pov : js->rgdwPOV) pov = 0xFFFFFFFFu; // centered
+        std::memset(js->rgbButtons, 0, sizeof(js->rgbButtons));
+    } else { // DIJOYSTATE2
+        auto* js = static_cast<DIJOYSTATE2*>(data);
+        std::memcpy(&js->lX, n.axis, sizeof(n.axis));
+        for (auto& pov : js->rgdwPOV) pov = 0xFFFFFFFFu;
+        std::memset(js->rgbButtons, 0, sizeof(js->rgbButtons));
+        // The trailing velocity/acceleration/force blocks are deltas; zero is
+        // genuinely neutral for them.
+        std::memset(&js->lVX, 0,
+                    static_cast<size_t>(reinterpret_cast<char*>(js + 1) -
+                                        reinterpret_cast<char*>(&js->lVX)));
+    }
+}
+
+template <int I>
+HRESULT WINAPI di_state_detour(IDirectInputDevice8W* dev, DWORD cb, LPVOID data) {
+    const HRESULT hr = g_di_state_real[I](dev, cb, data);
+    if (hr != DI_OK || !data || !pad_blocking()) return hr;
+    if (cb == sizeof(DIJOYSTATE) || cb == sizeof(DIJOYSTATE2)) {
+        di_neutralize_joy(dev, cb, data);
+    } else if (cb == 256 /* keyboard */ || cb == sizeof(DIMOUSESTATE) ||
+               cb == sizeof(DIMOUSESTATE2)) {
+        std::memset(data, 0, cb); // keys/buttons released, zero deltas
+    } else {
+        // Custom data format (layout unknown): hold the first blocked read
+        // frozen -- stale-but-plausible beats zeroing unknown axes. The
+        // snapshots are cleared on each menu open.
+        std::lock_guard<std::mutex> lk(g_di_mutex);
+        auto& snap = g_joy_frozen[dev];
+        if (snap.size() != cb)
+            snap.assign(static_cast<uint8_t*>(data),
+                        static_cast<uint8_t*>(data) + cb);
+        else
+            std::memcpy(data, snap.data(), cb);
+    }
+    return hr;
+}
+
+template <int I>
+HRESULT WINAPI di_data_detour(IDirectInputDevice8W* dev, DWORD cb_obj,
+                              LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdw_inout,
+                              DWORD flags) {
+    const HRESULT hr = g_di_data_real[I](dev, cb_obj, rgdod, pdw_inout, flags);
+    if (SUCCEEDED(hr) && pdw_inout && pad_blocking())
+        *pdw_inout = 0; // "no buffered events" -- safe for every device type
+    return hr;
+}
+
+// Install the dinput8 vtable hooks. Called from setup(); retried on the first
+// menu open in case dinput8.dll loads after us. Idempotent.
+void hook_dinput8() {
+    if (g_dinput_hooked.load()) return;
+    HMODULE dim = GetModuleHandleA("dinput8.dll");
+    if (!dim) return; // not loaded (yet); caller retries
+    using DI8Create_t = HRESULT(WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    const auto create =
+        reinterpret_cast<DI8Create_t>(GetProcAddress(dim, "DirectInput8Create"));
+    if (!create) return;
+
+    void* state_fns[2] = {};
+    void* data_fns[2] = {};
+    int found = 0;
+    const IID* iids[2] = {&IID_IDirectInput8W, &IID_IDirectInput8A};
+    for (const IID* iid : iids) {
+        void* dip = nullptr;
+        if (FAILED(create(g_hinst, DIRECTINPUT_VERSION, *iid, &dip, nullptr)) || !dip)
+            continue;
+        // A and W share the method layout of the slots we touch; type as W.
+        auto* di = static_cast<IDirectInput8W*>(dip);
+        IDirectInputDevice8W* dev = nullptr;
+        if (SUCCEEDED(di->CreateDevice(GUID_SysKeyboard, &dev, nullptr)) && dev) {
+            void** vtbl = *reinterpret_cast<void***>(dev);
+            void* st = vtbl[9];  // GetDeviceState
+            void* da = vtbl[10]; // GetDeviceData
+            bool dup = false;
+            for (int i = 0; i < found; ++i)
+                if (state_fns[i] == st) dup = true;
+            if (!dup && found < 2) {
+                state_fns[found] = st;
+                data_fns[found] = da;
+                ++found;
+            }
+            dev->Release();
+        }
+        di->Release(); // vtable code stays resident in dinput8.dll
+    }
+    if (!found) {
+        flog("[overlay] [WARN] dinput8 vtable resolve failed; pad may leak while menu open");
+        return;
+    }
+
+    const DIGetDeviceState_t sdet[2] = {&di_state_detour<0>, &di_state_detour<1>};
+    const DIGetDeviceData_t  ddet[2] = {&di_data_detour<0>, &di_data_detour<1>};
+    bool queued = false;
+    for (int i = 0; i < found; ++i) {
+        if (hooks::create(state_fns[i], reinterpret_cast<void*>(sdet[i]),
+                          reinterpret_cast<void**>(&g_di_state_real[i])))
+            queued = true;
+        if (hooks::create(data_fns[i], reinterpret_cast<void*>(ddet[i]),
+                          reinterpret_cast<void**>(&g_di_data_real[i])))
+            queued = true;
+    }
+    if (queued && hooks::apply()) {
+        g_dinput_hooked.store(true);
+        flog("[overlay] dinput8 GetDeviceState/GetDeviceData detoured (%d vtable%s)",
+             found, found > 1 ? "s" : "");
+    } else {
+        flog("[overlay] [WARN] dinput8 hook failed; pad may leak while menu open");
+    }
+}
+
+// Detour XInputGetState + XInputGetStateEx(#100) in every currently-loaded
+// xinput module. Idempotent; called on EVERY menu open, never at setup().
+// Hooking at first menu open guarantees (a) any lazily loaded xinput modules
+// exist by then and (b) our detour is patched in LAST, i.e. outermost --
+// anything that hooked the same export earlier (Steam Input's emulation layer
+// etc.) runs INSIDE us, so our zeroing is what the game finally receives.
+void* g_xi_seen[6] = {};
+int   g_xi_slot = 0;
+bool  g_mh_ok = false; // hooks::init() result, set in setup()
+
+void hook_xinput() {
+    if (!g_mh_ok || g_xi_slot >= 6) return;
+    const char* xdlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
+    using Detour_t = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+    const Detour_t detours[6] = {&xi_detour<0>, &xi_detour<1>, &xi_detour<2>,
+                                 &xi_detour<3>, &xi_detour<4>, &xi_detour<5>};
+    bool queued = false;
+    for (const char* d : xdlls) {
+        HMODULE h = GetModuleHandleA(d);
+        if (!h) continue;
+        // Named export + ordinal 100 (XInputGetStateEx: same signature, adds
+        // the Guide button) -- a game reading Ex bypasses the named export.
+        const char* names[2] = {"XInputGetState",
+                                reinterpret_cast<const char*>(MAKEINTRESOURCEA(100))};
+        for (int e = 0; e < 2; ++e) {
+            void* fn = reinterpret_cast<void*>(GetProcAddress(h, names[e]));
+            if (!fn) continue;
+            bool dup = false; // 9_1_0 can forward to 1_4's export
+            for (int i = 0; i < g_xi_slot; ++i)
+                if (g_xi_seen[i] == fn) dup = true;
+            if (dup || g_xi_slot >= 6) continue;
+            if (hooks::create(fn, reinterpret_cast<void*>(detours[g_xi_slot]),
+                              reinterpret_cast<void**>(&g_xi_real[g_xi_slot]))) {
+                g_xi_seen[g_xi_slot] = fn;
+                // If our own polling pointed at this raw proc, upgrade it to
+                // the trampoline -- otherwise poll_gamepad would read through
+                // our own detour and see a zeroed pad while the menu is open.
+                if (!pXInputGetState ||
+                    pXInputGetState == reinterpret_cast<XInputGetState_t>(fn))
+                    pXInputGetState = g_xi_real[g_xi_slot];
+                ++g_xi_slot;
+                queued = true;
+                flog("[overlay] XInputGetState%s detoured in %s",
+                     e ? "Ex(#100)" : "", d);
+            }
+        }
+    }
+    if (queued && !hooks::apply())
+        flog("[overlay] [WARN] MinHook apply failed; pad may leak to the game while menu open");
+}
+
+// ── raw-input capture (keyboard/mouse without focus) ──
+// Windows keeps ONE raw-input registration per usage per process; registering
+// kb + mouse with our hwnd (RIDEV_INPUTSINK -- we are never the foreground
+// thread) atomically routes WM_INPUT to us and starves whoever registered
+// before (the game, or DirectInput on its behalf). The prior registration is
+// snapshotted and restored exactly on close.
+std::vector<RAWINPUTDEVICE> g_rid_saved; // the game's kb/mouse entries
+bool g_raw_captured = false;
+
+constexpr USHORT kHidPage = 0x01, kHidMouse = 0x02, kHidKeyboard = 0x06;
+
+bool rid_is_kbm(const RAWINPUTDEVICE& r) {
+    return r.usUsagePage == kHidPage &&
+           (r.usUsage == kHidMouse || r.usUsage == kHidKeyboard);
+}
+
+// The process's current kb/mouse raw-input registrations.
+std::vector<RAWINPUTDEVICE> rid_process_kbm() {
+    std::vector<RAWINPUTDEVICE> out;
+    UINT n = 0;
+    GetRegisteredRawInputDevices(nullptr, &n, sizeof(RAWINPUTDEVICE));
+    if (!n) return out;
+    std::vector<RAWINPUTDEVICE> all(n);
+    if (GetRegisteredRawInputDevices(all.data(), &n, sizeof(RAWINPUTDEVICE)) ==
+        static_cast<UINT>(-1))
+        return out;
+    all.resize(n);
+    for (const auto& r : all)
+        if (rid_is_kbm(r)) out.push_back(r);
+    return out;
+}
+
+bool rid_register_ours() {
+    RAWINPUTDEVICE rid[2] = {
+        {kHidPage, kHidMouse,    RIDEV_INPUTSINK, g_hwnd},
+        {kHidPage, kHidKeyboard, RIDEV_INPUTSINK, g_hwnd},
+    };
+    return RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE)) != FALSE;
+}
+
+void raw_input_capture(bool on) {
+    if (on == g_raw_captured) return;
+    if (on) {
+        g_rid_saved = rid_process_kbm();
+        if (!rid_register_ours()) {
+            flog("[overlay] [WARN] raw-input capture failed (err %lu) -- "
+                 "keyboard/mouse degraded while menu open", GetLastError());
+            return;
+        }
+        g_raw_captured = true;
+        return;
+    }
+    // Restore the snapshot; a usage that had no prior registration gets
+    // RIDEV_REMOVE so we don't keep swallowing input after close.
+    RAWINPUTDEVICE restore[2] = {
+        {kHidPage, kHidMouse,    RIDEV_REMOVE, nullptr},
+        {kHidPage, kHidKeyboard, RIDEV_REMOVE, nullptr},
+    };
+    for (const auto& r : g_rid_saved)
+        restore[r.usUsage == kHidMouse ? 0 : 1] = r;
+    if (!RegisterRawInputDevices(restore, 2, sizeof(RAWINPUTDEVICE))) {
+        // Per-entry fallback: one stale hwnd (game recreated its window) must
+        // not block the other usage; downgrade stale entries to REMOVE -- the
+        // game re-registers on demand when it next touches raw input.
+        bool ok = true;
+        for (auto& r : restore) {
+            if (RegisterRawInputDevices(&r, 1, sizeof(RAWINPUTDEVICE))) continue;
+            RAWINPUTDEVICE rm{r.usUsagePage, r.usUsage, RIDEV_REMOVE, nullptr};
+            if (!RegisterRawInputDevices(&rm, 1, sizeof(RAWINPUTDEVICE))) ok = false;
+        }
+        if (!ok) {
+            flog("[overlay] [ERROR] raw-input restore failed (err %lu) -- "
+                 "game input may be dead; retrying", GetLastError());
+            return; // stays "captured": the render loop retries every tick
+        }
+        flog("[overlay] [WARN] raw-input restore downgraded to unregister");
+    }
+    g_raw_captured = false;
+}
+
+// The game (or DirectInput) can re-register raw input while our menu is open
+// (device hotplug, window recreation). Once per frame: if any kb/mouse usage
+// no longer targets us, fold the newcomer into the restore snapshot and
+// re-route to our window.
+void raw_input_reassert() {
+    if (!g_raw_captured) return;
+    bool ours = true;
+    for (const auto& r : rid_process_kbm()) {
+        if (r.hwndTarget == g_hwnd) continue;
+        ours = false;
+        bool merged = false;
+        for (auto& s : g_rid_saved)
+            if (s.usUsage == r.usUsage) { s = r; merged = true; }
+        if (!merged) g_rid_saved.push_back(r);
+    }
+    if (!ours && !rid_register_ours())
+        flog("[overlay] [WARN] raw-input re-assert failed (err %lu)", GetLastError());
+}
+
+// ── WM_INPUT -> ImGui ──
+// Virtual mouse cursor in overlay-client coordinates, integrated from raw
+// deltas (immune to whatever the still-focused game does to the OS cursor).
+float g_vmx = 0.0f, g_vmy = 0.0f;
+
+void raw_mouse(const RAWMOUSE& m, ImGuiIO& io) {
+    if (m.usFlags & MOUSE_MOVE_ABSOLUTE) {
+        // Absolute devices (pen tablets, RDP): 0..65535 across the screen.
+        const bool vd = (m.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+        POINT p{static_cast<LONG>((vd ? GetSystemMetrics(SM_XVIRTUALSCREEN) : 0) +
+                    m.lLastX * GetSystemMetrics(vd ? SM_CXVIRTUALSCREEN : SM_CXSCREEN) / 65535),
+                static_cast<LONG>((vd ? GetSystemMetrics(SM_YVIRTUALSCREEN) : 0) +
+                    m.lLastY * GetSystemMetrics(vd ? SM_CYVIRTUALSCREEN : SM_CYSCREEN) / 65535)};
+        ScreenToClient(g_hwnd, &p);
+        g_vmx = static_cast<float>(p.x);
+        g_vmy = static_cast<float>(p.y);
+    } else {
+        g_vmx += static_cast<float>(m.lLastX);
+        g_vmy += static_cast<float>(m.lLastY);
+    }
+    g_vmx = std::clamp(g_vmx, 0.0f, g_back_w > 1 ? g_back_w - 1.0f : 0.0f);
+    g_vmy = std::clamp(g_vmy, 0.0f, g_back_h > 1 ? g_back_h - 1.0f : 0.0f);
+    io.AddMousePosEvent(g_vmx, g_vmy);
+
+    const USHORT f = m.usButtonFlags;
+    if (f & RI_MOUSE_LEFT_BUTTON_DOWN)   io.AddMouseButtonEvent(0, true);
+    if (f & RI_MOUSE_LEFT_BUTTON_UP)     io.AddMouseButtonEvent(0, false);
+    if (f & RI_MOUSE_RIGHT_BUTTON_DOWN)  io.AddMouseButtonEvent(1, true);
+    if (f & RI_MOUSE_RIGHT_BUTTON_UP)    io.AddMouseButtonEvent(1, false);
+    if (f & RI_MOUSE_MIDDLE_BUTTON_DOWN) io.AddMouseButtonEvent(2, true);
+    if (f & RI_MOUSE_MIDDLE_BUTTON_UP)   io.AddMouseButtonEvent(2, false);
+    if (f & RI_MOUSE_BUTTON_4_DOWN)      io.AddMouseButtonEvent(3, true);
+    if (f & RI_MOUSE_BUTTON_4_UP)        io.AddMouseButtonEvent(3, false);
+    if (f & RI_MOUSE_BUTTON_5_DOWN)      io.AddMouseButtonEvent(4, true);
+    if (f & RI_MOUSE_BUTTON_5_UP)        io.AddMouseButtonEvent(4, false);
+    if (f & RI_MOUSE_WHEEL)
+        io.AddMouseWheelEvent(0.0f,
+            static_cast<float>(static_cast<SHORT>(m.usButtonData)) / WHEEL_DELTA);
+    if (f & RI_MOUSE_HWHEEL)
+        io.AddMouseWheelEvent(
+            -static_cast<float>(static_cast<SHORT>(m.usButtonData)) / WHEEL_DELTA, 0.0f);
+}
+
+// Forward a raw key as a synthetic WM_KEY* to the ImGui Win32 backend (reuses
+// its full VK -> ImGuiKey mapping) plus WM_CHAR text via ToUnicode. The
+// backend's own modifier reads (GetKeyState) are stale on this never-focused
+// thread; update_modifiers() below feeds the truth every frame. No IME without
+// focus -- acceptable for the ASCII-lowercased search box.
+void raw_keyboard(const RAWKEYBOARD& k) {
+    if (k.VKey == 0 || k.VKey >= 255) return; // fake keys / overrun marker
+    const bool down = (k.Flags & RI_KEY_BREAK) == 0;
+    const UINT scan = k.MakeCode & 0xFFu;
+    LPARAM lp = 1 | (static_cast<LPARAM>(scan) << 16);
+    if (k.Flags & RI_KEY_E0) lp |= static_cast<LPARAM>(1) << 24;
+    if (!down) lp |= (static_cast<LPARAM>(1) << 30) | (static_cast<LPARAM>(1) << 31);
+    ImGui_ImplWin32_WndProcHandler(g_hwnd, down ? WM_KEYDOWN : WM_KEYUP, k.VKey, lp);
+
+    if (!down || kd(VK_CONTROL) || kd(VK_MENU)) return; // no text from chords
+    BYTE ks[256] = {};
+    if (kd(VK_SHIFT)) ks[VK_SHIFT] = 0x80;
+    if (GetKeyState(VK_CAPITAL) & 1) ks[VK_CAPITAL] = 0x01;
+    WCHAR buf[4] = {};
+    const int n = ToUnicode(k.VKey, scan, ks, buf, 4, 0);
+    for (int i = 0; i < n; ++i)
+        if (buf[i] >= 32)
+            ImGui_ImplWin32_WndProcHandler(g_hwnd, WM_CHAR, buf[i], 0);
+}
+
+void on_raw_input(HRAWINPUT h) {
+    // Only feed ImGui while it will consume events next frame; a failed
+    // restore with the menu closed must not grow the io queue unboundedly.
+    if (!g_context_inited || !g_raw_captured || !g_menu_open.load()) return;
+    RAWINPUT ri{};
+    UINT sz = sizeof(ri);
+    if (GetRawInputData(h, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) ==
+        static_cast<UINT>(-1))
+        return;
+    if (ri.header.dwType == RIM_TYPEMOUSE)
+        raw_mouse(ri.data.mouse, ImGui::GetIO());
+    else if (ri.header.dwType == RIM_TYPEKEYBOARD)
+        raw_keyboard(ri.data.keyboard);
+}
+
+// Feed modifier state from the hardware. The win32 backend derives modifiers
+// from GetKeyState, which only updates for threads that receive real keyboard
+// messages -- ours never does.
+void update_modifiers() {
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddKeyEvent(ImGuiMod_Ctrl,  kd(VK_CONTROL));
+    io.AddKeyEvent(ImGuiMod_Shift, kd(VK_SHIFT));
+    io.AddKeyEvent(ImGuiMod_Alt,   kd(VK_MENU));
+    io.AddKeyEvent(ImGuiMod_Super, kd(VK_LWIN) || kd(VK_RWIN));
+}
+
 // ── window ──
 LRESULT CALLBACK overlay_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-        return 0;
     switch (msg) {
+    case WM_INPUT:
+        on_raw_input(reinterpret_cast<HRAWINPUT>(lParam));
+        return DefWindowProcW(hWnd, msg, wParam, lParam); // required cleanup
     case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE; // never steal the game's focus on a click
+        return MA_NOACTIVATE; // NEVER take focus (see the input section)
     case WM_SETCURSOR:
-        if (LOWORD(lParam) == HTCLIENT) { SetCursor(nullptr); return TRUE; }
+        // Hide the OS cursor over our window ONLY while the menu is open (we draw
+        // a software cursor then). While closed we must never dictate the cursor
+        // -- SetCursor(nullptr) sets the global cursor to none, which on the
+        // DComp path (window still shown-transparent over the game) would leave
+        // the game's cursor hidden. Fall through so the game keeps its cursor.
+        if (g_menu_open.load() && LOWORD(lParam) == HTCLIENT) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
         return DefWindowProcW(hWnd, msg, wParam, lParam);
     case WM_DESTROY:
         return 0;
-    default:
-        return DefWindowProcW(hWnd, msg, wParam, lParam);
     }
+    // Legacy mouse messages still arrive over our topmost window while it is
+    // interactive; raw input is the single mouse source (double-feeding makes
+    // the cursor jump between the OS and virtual positions), so swallow them.
+    // The focus_input fallback keeps the old native path through the backend.
+    if (!g_focus_input && msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST)
+        return 0;
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return 0;
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 // Pick the foreground window if it belongs to our process (skip tool windows, i.e.
@@ -443,6 +840,22 @@ void cover_game_window(int& out_w, int& out_h) {
     SetWindowPos(g_hwnd, HWND_TOPMOST, tl.x, tl.y, w, h, SWP_NOACTIVATE);
     out_w = w;
     out_h = h;
+}
+
+// Toggle the overlay window between hit-testable (menu open: it swallows the
+// legacy mouse messages so they can't reach the game) and click-through (menu
+// closed: everything falls through). Only WS_EX_TRANSPARENT toggles --
+// WS_EX_NOACTIVATE is permanent, the overlay never takes focus. The window
+// stays SHOWN either way; keeping the game covered holds its DWM presentation
+// steady so closing never triggers a present-mode transition.
+void set_click_through(bool on) {
+    if (!g_hwnd) return;
+    LONG ex = GetWindowLongW(g_hwnd, GWL_EXSTYLE);
+    if (on) ex |=  WS_EX_TRANSPARENT;
+    else    ex &= ~WS_EX_TRANSPARENT;
+    SetWindowLongW(g_hwnd, GWL_EXSTYLE, ex);
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 }
 
 // ── Proton/Wine layered-window fallback (DComp is E_NOTIMPL under Wine) ──
@@ -707,6 +1120,50 @@ void draw_talisman_window() {
     ImGui::Separator();
     ImGui::Spacing();
 
+    // ── Import prompt: a new character with no saved preset, shown only when
+    //    OTHER characters already have presets to import from (set by the worker).
+    if (g_state.import_prompt_active && !g_state.import_candidates.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.16f, 0.12f, 0.05f, 0.85f));
+        ImGui::BeginChild("##import_banner", ImVec2(0, 0),
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Border);
+        ImGui::TextColored(kGold, "New character - no saved preset");
+        ImGui::TextWrapped("Start fresh (all talismans off), or import another "
+                           "character's setup:");
+        static int import_sel = 0;
+        if (import_sel >= static_cast<int>(g_state.import_candidates.size())) import_sel = 0;
+        auto cand_label = [&](int i) {
+            const auto& c = g_state.import_candidates[static_cast<size_t>(i)];
+            return c.second.empty() ? c.first : c.second; // display name, else key
+        };
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##import_from", cand_label(import_sel).c_str())) {
+            for (int i = 0; i < static_cast<int>(g_state.import_candidates.size()); ++i) {
+                const bool is_sel = (i == import_sel);
+                if (ImGui::Selectable(cand_label(i).c_str(), is_sel)) import_sel = i;
+                if (is_sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        // The worker performs the copy + save (all disk I/O off the render thread);
+        // clear the prompt now for immediate feedback.
+        if (ImGui::Button("Import selected")) {
+            g_state.import_from_key = g_state.import_candidates[static_cast<size_t>(import_sel)].first;
+            g_state.import_requested = true;
+            g_state.import_prompt_active = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Start fresh")) {
+            g_state.import_from_key.clear();
+            g_state.import_requested = true;
+            g_state.import_prompt_active = false;
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+    }
+
     // ── Settings: the global toggles, grouped and set off from the list below ──
     bool stacking = g_state.allow_stacking;
     if (ImGui::Checkbox("Allow stacking (ignore talisman families)", &stacking)) {
@@ -898,14 +1355,38 @@ void draw_talisman_window() {
 void update_menu_toggle() {
     const bool ours = foreground_is_ours();
 
-    static bool prev_open_in = false;
-    const bool key = ours && kd(static_cast<int>(g_open_vk));
-    const bool combo = ours && g_pad_ok && g_open_pad_mask &&
-                       (g_pad.wButtons & g_open_pad_mask) == g_open_pad_mask;
-    const bool open_in = key || combo;
-    if (open_in && !prev_open_in)
+    static bool prev_key_in = false;
+    const bool key_in = ours && kd(static_cast<int>(g_open_vk));
+    bool toggled = key_in && !prev_key_in;
+    prev_key_in = key_in;
+
+    const bool combo_in = ours && g_pad_ok && g_open_pad_mask &&
+                          (g_pad.wButtons & g_open_pad_mask) == g_open_pad_mask;
+    if (g_open_pad_is_hold) {
+        static bool combo_active = false, combo_fired = false;
+        static std::chrono::steady_clock::time_point combo_since;
+        if (combo_in) {
+            if (!combo_active) {
+                combo_active = true;
+                combo_fired = false;
+                combo_since = std::chrono::steady_clock::now();
+            } else if (!combo_fired) {
+                const auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - combo_since).count();
+                if (held_ms >= kPadHoldMs) { toggled = true; combo_fired = true; }
+            }
+        } else {
+            combo_active = false;
+            combo_fired = false;
+        }
+    } else {
+        static bool prev_combo_in = false;
+        if (combo_in && !prev_combo_in) toggled = true;
+        prev_combo_in = combo_in;
+    }
+
+    if (toggled)
         g_menu_open.store(!g_menu_open.load());
-    prev_open_in = open_in;
 
     static bool prev_esc = false, prev_padb = false;
     const bool esc = ours && kd(VK_ESCAPE);
@@ -918,10 +1399,49 @@ void update_menu_toggle() {
     static bool prev_open = false;
     const bool open_now = g_menu_open.load();
     if (open_now && !prev_open) {
-        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        // Cover the game first (so we open at the right place/size), make the
+        // window hit-testable, and redirect raw input to us. The game KEEPS
+        // foreground focus and stays shown-covered: neither its activation nor
+        // its presentation state changes, so frame-gen pipelines don't re-init.
+        // DComp path: the window is HIDDEN while the menu is closed (see the
+        // close branch) so it can't intercept the game's cursor/clicks -- reveal
+        // it here. It still holds the transparent frame committed on close, so
+        // showing it is flash-free. Layered path stays always-shown.
+        if (!g_use_layered) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+        int gw = 0, gh = 0;
+        cover_game_window(gw, gh);
+        set_click_through(false);
+        if (g_focus_input) {
+            force_foreground(g_hwnd); // legacy escape-hatch mode ([overlay] focus_input)
+        } else {
+            hook_xinput();  // install/refresh pad detours LAST-hooked = outermost
+            hook_dinput8(); // no-op if already hooked; retry if dinput8 loaded late
+            { // fresh freeze-frames for custom-format devices this session
+                std::lock_guard<std::mutex> lk(g_di_mutex);
+                g_joy_frozen.clear();
+            }
+            raw_input_capture(true);
+            // Start the virtual cursor centered.
+            g_vmx = 0.5f * static_cast<float>(gw > 0 ? gw : static_cast<int>(g_back_w));
+            g_vmy = 0.5f * static_cast<float>(gh > 0 ? gh : static_cast<int>(g_back_h));
+            if (g_context_inited) ImGui::GetIO().AddMousePosEvent(g_vmx, g_vmy);
+        }
     } else if (!open_now && prev_open) {
-        ShowWindow(g_hwnd, SW_HIDE);
+        // Blank to one fully-transparent frame and go click-through; the
+        // window stays SHOWN (hiding uncovers the game -> DWM present-mode
+        // transition) and the game never lost focus, so gameplay resumes
+        // instantly -- no frozen-frame stall.
+        render_frame(false);
+        set_click_through(true);
+        // DComp path: WS_EX_TRANSPARENT click-through is unreliable for this
+        // (non-layered) topmost window -- it keeps receiving WM_SETCURSOR/clicks
+        // over the game, stealing the cursor. Hide it outright while closed; the
+        // game has no frame-gen on this path (erdGameTools forces the layered
+        // path), so hiding can't trigger the activation/present freeze. The
+        // layered path stays shown: its alpha-0 frame is already input-transparent.
+        if (!g_use_layered) ShowWindow(g_hwnd, SW_HIDE);
+        if (g_focus_input && g_game_hwnd) force_foreground(g_game_hwnd);
+        raw_input_capture(false); // give the game its raw input back
         std::lock_guard<std::mutex> l(g_state_mutex);
         g_state.save_requested = true; // auto-save selections on close
     }
@@ -938,8 +1458,12 @@ void overlay_thread() {
     wc.hCursor = nullptr;
     RegisterClassExW(&wc);
 
-    const DWORD ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST |
-                     WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+    // WS_EX_NOACTIVATE: the overlay must never take focus -- activation changes
+    // on the game window make frame-gen mods re-init for seconds (alt-tab
+    // freeze); input is captured focus-free (see the input section).
+    // WS_EX_NOREDIRECTIONBITMAP is required for the DComp swapchain path.
+    const DWORD ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW |
+                     WS_EX_NOACTIVATE;
     g_hwnd = CreateWindowExW(ex, kOverlayClass, L"Custom Talisman Effects overlay", WS_POPUP,
                              0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_hwnd) {
@@ -954,13 +1478,73 @@ void overlay_thread() {
         return;
     }
 
-    ShowWindow(g_hwnd, SW_HIDE); // menu starts closed -> window hidden
+    // Menu starts closed. Closed-state window handling differs by path:
+    //  - Layered (erdGameTools/Wine): stay SHOWN with a committed alpha-0 frame.
+    //    That frame is per-pixel input-transparent, so the window holds the
+    //    game's DWM presentation steady without intercepting cursor/clicks. This
+    //    is also what avoids the erdGameTools activation/present freeze.
+    //  - DComp: HIDDEN while closed. WS_EX_TRANSPARENT click-through is
+    //    unreliable for this non-layered topmost window, so leaving it shown
+    //    would steal WM_SETCURSOR from the game (cursor vanishes) and cover the
+    //    desktop on exit. No erdGameTools on this path, so hiding is freeze-safe.
+    // Commit one transparent frame first (the layered path needs its content set
+    // via UpdateLayeredWindow before it is shown).
+    set_click_through(true);
+    render_frame(false); // commit one fully-transparent frame
+    if (g_use_layered) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    else               ShowWindow(g_hwnd, SW_HIDE);
 
     while (g_running.load()) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        // Track the game window every tick (not only while covering) so the
+        // shutdown check below works even if the menu was never opened.
+        find_game_window();
+
+        // Game shutdown detection: when the game window dies but the process
+        // lingers (me3 keeps it alive during teardown), our always-shown
+        // topmost window would keep sitting over the desktop and leave it
+        // unresponsive until the process finally exits. Give the game a short
+        // grace period to recreate its window (display-mode changes do that),
+        // then tear the overlay down for good.
+        static ULONGLONG dead_since = 0;
+        if (g_game_hwnd && !IsWindow(g_game_hwnd)) {
+            g_game_hwnd = nullptr; // stale; find_game_window may re-adopt
+            dead_since = GetTickCount64();
+            // The game window is gone: there is nothing left to keep steady, so
+            // drop our always-shown topmost window IMMEDIATELY rather than waiting
+            // out the grace -- otherwise it covers the desktop and locks it until
+            // the process finally exits (me3 lingers). Safe on both paths: no
+            // game window means no DWM/frame-gen state to protect.
+            ShowWindow(g_hwnd, SW_HIDE);
+            flog("[overlay] game window died -- overlay hidden, grace before teardown");
+        }
+        if (dead_since) {
+            // Only cancel teardown if a REAL game window came back (a display-mode
+            // change recreates it). A transient or hidden process window during
+            // me3 shutdown must not keep resetting the grace timer forever, or the
+            // thread never exits.
+            HWND back = find_game_window();
+            RECT cr{};
+            const bool real = back && IsWindow(back) && IsWindowVisible(back) &&
+                              GetClientRect(back, &cr) &&
+                              (cr.right - cr.left) > 0 && (cr.bottom - cr.top) > 0;
+            if (real) {
+                dead_since = 0; // window came back (display-mode change)
+                flog("[overlay] game window re-adopted -- overlay restored");
+                // Re-show if the menu is open, or on the layered path (which is
+                // always-shown even when closed). Closed DComp stays hidden.
+                if (g_menu_open.load() || g_use_layered)
+                    ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+            } else if (GetTickCount64() - dead_since > 3000) {
+                flog("[overlay] game window gone -- removing overlay window");
+                g_menu_open.store(false);
+                break; // -> teardown() destroys our window; thread exits
+            }
         }
 
         poll_gamepad();
@@ -975,17 +1559,21 @@ void overlay_thread() {
                 (static_cast<UINT>(gw) != g_back_w || static_cast<UINT>(gh) != g_back_h))
                 seh_resize(static_cast<UINT>(gw), static_cast<UINT>(gh));
 
+            raw_input_reassert(); // keep kb/mouse routed to us (game may re-register)
+
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
-            feed_keyboard();
             feed_gamepad();
+            update_modifiers(); // hardware truth; backend's GetKeyState is stale here
             ImGui::NewFrame();
             ImGui::GetIO().MouseDrawCursor = true; // our window has no OS cursor
             draw_talisman_window();
             ImGui::Render();
             render_frame(true);
         } else {
-            // Menu closed -> our window is hidden, so there is nothing to show.
+            // Menu closed -> our window stays SHOWN but holds its last committed
+            // fully-transparent frame (see update_menu_toggle), so it's invisible
+            // and click-through while keeping the game covered/composited.
             // Deliberately do NO GPU work here: no Present, no ResizeBuffers. A
             // thread suspended mid-Present holds a driver/DXGI lock, and when
             // another mod installs its own hooks via MinHook (which suspends
@@ -993,6 +1581,7 @@ void overlay_thread() {
             // game deadlocks/freezes on startup. Idling here keeps this thread
             // safe to suspend and cuts pointless GPU churn. The first open frame
             // re-covers + resizes before drawing, so nothing is stale.
+            if (g_raw_captured) raw_input_capture(false); // retry a failed restore
             Sleep(32);
         }
     }
@@ -1000,6 +1589,7 @@ void overlay_thread() {
 
 // ── best-effort teardown (the process usually just exits) ──
 void teardown() {
+    raw_input_capture(false); // never leave the game's raw input starved
     if (g_d3d_inited) {
         __try { ImGui_ImplDX11_Shutdown(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
@@ -1024,44 +1614,40 @@ void overlay::sync_open_keys() {
     std::lock_guard<std::mutex> lk(g_state_mutex);
     g_open_vk = g_state.open_vk;
     g_open_pad_mask = g_state.open_pad_mask;
+    g_open_pad_is_hold = g_state.open_pad_is_hold;
+    g_focus_input = g_state.focus_input;
 }
 
 void overlay::setup() {
     sync_open_keys();
 
-    // Queue the input hooks. None of these touch the game's swapchain, so the
-    // overlay is safe alongside frame-gen / Special K / other overlay mods. They
-    // are committed by cte::hooks::apply() (called from the worker after setup()).
-    if (HMODULE u32 = GetModuleHandleA("user32.dll")) {
-        auto queue = [u32](const char* name, void* detour, void** tramp) {
-            if (void* p = reinterpret_cast<void*>(GetProcAddress(u32, name)))
-                hooks::create(p, detour, tramp);
-        };
-        queue("GetRawInputData", reinterpret_cast<void*>(&hkGetRawInputData),
-              reinterpret_cast<void**>(&oGetRawInputData));
-        queue("SetCursorPos", reinterpret_cast<void*>(&hkSetCursorPos),
-              reinterpret_cast<void**>(&oSetCursorPos));
-        queue("ClipCursor", reinterpret_cast<void*>(&hkClipCursor),
-              reinterpret_cast<void**>(&oClipCursor));
-    }
-
+    // Gamepad. We must both READ the pad (menu nav + the open/close combo) and
+    // BLOCK it from reaching the still-focused game while the menu is open.
+    // Reading: resolve XInputGetState directly here (no hook needed to read).
+    // Blocking: XInput detours are installed by hook_xinput() at MENU OPEN,
+    // deliberately not here -- hooking early proved ineffective (see the
+    // comment on hook_xinput); dinput8 (the path ER actually polls) is hooked
+    // now and retried on open if the module loads late.
     {
         const char* xdlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
-        void* xfn = nullptr;
         for (const char* d : xdlls) {
             HMODULE h = GetModuleHandleA(d);
-            if (h) { xfn = reinterpret_cast<void*>(GetProcAddress(h, "XInputGetState")); if (xfn) break; }
+            if (!h) continue;
+            pXInputGetState =
+                reinterpret_cast<XInputGetState_t>(GetProcAddress(h, "XInputGetState"));
+            if (pXInputGetState) break;
         }
-        if (!xfn)
+        if (!pXInputGetState)
             if (HMODULE h = LoadLibraryA("xinput1_4.dll"))
-                xfn = reinterpret_cast<void*>(GetProcAddress(h, "XInputGetState"));
-        if (xfn) {
-            pXInputGetState = reinterpret_cast<XInputGetState_t>(xfn);
-            hooks::create(xfn, reinterpret_cast<void*>(&hkXInputGetState),
-                          reinterpret_cast<void**>(&oXInputGetState));
-        } else {
-            flog("[overlay] [WARN] XInputGetState not found; gamepad open combo unavailable");
-        }
+                pXInputGetState =
+                    reinterpret_cast<XInputGetState_t>(GetProcAddress(h, "XInputGetState"));
+        if (!pXInputGetState)
+            flog("[overlay] [WARN] XInputGetState not found; gamepad unavailable");
+
+        g_mh_ok = hooks::init();
+        if (!g_mh_ok)
+            flog("[overlay] [WARN] MinHook init failed; pad will leak to the game while menu open");
+        hook_dinput8();
     }
 
     // Spawn the dedicated overlay thread (window + D3D11 + DComp + ImGui + loop).
@@ -1071,7 +1657,7 @@ void overlay::setup() {
         teardown();
         g_running.store(false);
     }).detach();
-    flog("[overlay] separate-window overlay thread spawned; input hooks queued");
+    flog("[overlay] separate-window overlay thread spawned (focus-free input)");
 }
 
 } // namespace cte
