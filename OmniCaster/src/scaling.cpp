@@ -268,26 +268,43 @@ void highest_stat_tick(const Config& cfg) {
 
     static bool have_choice = false;
     static bool use_int     = true;
-    static bool dumped      = false;
+    static CasterStats previous{};
+    static bool have_previous = false;
 
     CasterStats st;
     if (!read_caster_stats(st))
         return; // main menu / offsets wrong -- keep whatever is active
 
-    if (cfg.dump && !dumped) {
+    const bool character_changed =
+        !have_previous || st.player_ins != previous.player_ins ||
+        st.player_game_data != previous.player_game_data ||
+        st.base_int != previous.base_int || st.base_fai != previous.base_fai;
+    const bool current_stats_changed =
+        !have_previous || st.eff_int != previous.eff_int ||
+        st.eff_fai != previous.eff_fai;
+
+    if (cfg.dump && character_changed)
         dump_stat_block();
-        dumped = true;
-    }
 
     const bool want_int = st.eff_int >= st.eff_fai; // tie -> INT
-    if (have_choice && want_int == use_int) return;
+    const bool choice_changed = !have_choice || want_int != use_int;
 
-    use_int     = want_int;
-    have_choice = true;
-    flip_all(use_int);
-    flog("highest-stat: effective INT=%d FAI=%d (base %d/%d) -> all catalysts now scale off %s",
-         st.eff_int, st.eff_fai, st.base_int, st.base_fai,
-         use_int ? "INT" : "FAI");
+    if (choice_changed) {
+        use_int = want_int;
+        have_choice = true;
+        flip_all(use_int);
+    }
+
+    if (choice_changed || current_stats_changed || character_changed) {
+        flog("highest-stat: current INT=%d (base %d%+d) FAI=%d (base %d%+d) -> %s%s",
+             st.eff_int, st.base_int, st.bonus_int,
+             st.eff_fai, st.base_fai, st.bonus_fai,
+             use_int ? "INT" : "FAI",
+             choice_changed ? " [catalysts updated]" : " [choice unchanged]");
+    }
+
+    previous = st;
+    have_previous = true;
 }
 
 } // namespace omni

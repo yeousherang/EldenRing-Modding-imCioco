@@ -21,8 +21,9 @@ usual mod loaders handle that).
 - **Highest-stat mode** (`scaling_mode = highest_stat`): every catalyst
   scales *both* spell types off the higher of your INT and FAI. Uses your
   **effective** stats — talismans, the physick, and buffs that raise INT/FAI
-  count. Tracked live: level up, respec, or swap a stat talisman and the
-  scaling stat flips within ~1 second.
+  count. It follows the currently loaded character rather than the
+  character-select/menu copy. Tracked live: load another character, level up,
+  respec, or swap a stat talisman and the scaling stat flips within ~1 second.
 
 ## What is deliberately NOT changed
 
@@ -77,9 +78,11 @@ the other across the three tables that produce that rating:
 Correction rows shared with non-catalyst weapons are detected and skipped
 (logged) so melee scaling can't be corrupted. `highest_stat` mode
 additionally reads your **effective** INT/FAI (the exact numbers the status
-screen shows, gear and buffs included) straight from the game's
-`PlayerGameData` — it keeps a pre-computed effective-stats block that the
-mod polls once a second.
+screen shows, gear and buffs included) from the current in-world `PlayerIns`.
+The mod reads that character's base stats and the INT/FAI corrections on its
+active game effects, then polls the result once a second. This is necessary
+because `PlayerGameData`'s stored “effective” block does not include every
+live correction (Godrick's Great Rune is one observed example).
 
 ## Overhaul mods (Convergence, Reforged, …)
 
