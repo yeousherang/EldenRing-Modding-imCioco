@@ -279,15 +279,14 @@ void highest_stat_tick(const Config& cfg) {
         dumped = true;
     }
 
-    const bool want_int = st.eff_int() >= st.eff_fai(); // tie -> INT
+    const bool want_int = st.eff_int >= st.eff_fai; // tie -> INT
     if (have_choice && want_int == use_int) return;
 
     use_int     = want_int;
     have_choice = true;
     flip_all(use_int);
-    flog("highest-stat: INT=%d (%d+%d) FAI=%d (%d+%d) -> all catalysts now scale off %s",
-         st.eff_int(), st.base_int, st.bonus_int,
-         st.eff_fai(), st.base_fai, st.bonus_fai,
+    flog("highest-stat: effective INT=%d FAI=%d (base %d/%d) -> all catalysts now scale off %s",
+         st.eff_int, st.eff_fai, st.base_int, st.base_fai,
          use_int ? "INT" : "FAI");
 }
 

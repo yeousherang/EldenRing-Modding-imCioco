@@ -1,8 +1,5 @@
 #include "player_stats.hpp"
 
-// libER: from::param::SpEffectParam (for stat-bonus effects)
-#include <param/param.hpp>
-
 #include "scan.hpp"
 #include "utils.hpp"
 
@@ -18,41 +15,8 @@ uintptr_t player_game_data() {
     return mem::deref(gdm + omni::kPlayerGameDataOffset);
 }
 
-// Local player ChrIns via WorldChrMan. 0 when not in-game.
-uintptr_t player_ins() {
-    const uintptr_t wcm = mem::deref(g_mod.base + omni::kWorldChrManOffset);
-    if (!wcm) return 0;
-    return mem::deref(wcm + omni::kPlayerInsOffset);
-}
-
-// Base stats are 1..99 (149 leaves headroom for oddball regulations).
+// Stats are 1..99 in practice; 148 leaves headroom for buffed oddballs.
 bool plausible_stat(int v) { return v >= 1 && v <= 148; }
-
-// Sum addMagicStatus / addFaithStatus over the player's active SpEffects
-// (talismans, physick, buffs -- every stat bonus in the game is a SpEffect).
-// Returns false when the list can't be walked (bonuses then count as 0).
-bool sum_stat_bonuses(int& bonus_int, int& bonus_fai) {
-    bonus_int = 0;
-    bonus_fai = 0;
-    const uintptr_t player = player_ins();
-    if (!player) return false;
-    const uintptr_t manager = mem::deref(player + omni::kSpEffectManagerOffset);
-    if (!manager) return false;
-    uintptr_t slot = mem::deref(manager + omni::kSpEffectFirstSlotOffset);
-    int guard = 0;
-    while (slot && guard++ < 512) {
-        int id = -1;
-        if (mem::safe_read(slot + omni::kSpEffectIdOffset, id) && id > 0) {
-            auto [row, ok] = from::param::SpEffectParam[id];
-            if (ok) {
-                bonus_int += row.addMagicStatus; // "Magic" == INT internally
-                bonus_fai += row.addFaithStatus;
-            }
-        }
-        slot = mem::deref(slot + omni::kSpEffectNextOffset);
-    }
-    return true;
-}
 
 } // namespace
 
@@ -75,13 +39,16 @@ bool player_stats_init() {
 bool read_caster_stats(CasterStats& out) {
     const uintptr_t pgd = player_game_data();
     if (!pgd) return false;
-    int i = 0, f = 0;
-    if (!mem::safe_read(pgd + kIntOffset, i)) return false;
-    if (!mem::safe_read(pgd + kFaithOffset, f)) return false;
-    if (!plausible_stat(i) || !plausible_stat(f)) return false; // garbage read
-    out.base_int = i;
-    out.base_fai = f;
-    sum_stat_bonuses(out.bonus_int, out.bonus_fai); // best-effort; 0s on failure
+    int ei = 0, ef = 0, bi = 0, bf = 0;
+    if (!mem::safe_read(pgd + kEffIntOffset, ei)) return false;
+    if (!mem::safe_read(pgd + kEffFaithOffset, ef)) return false;
+    if (!plausible_stat(ei) || !plausible_stat(ef)) return false; // garbage read
+    mem::safe_read(pgd + kBaseIntOffset, bi);   // log-only, best effort
+    mem::safe_read(pgd + kBaseFaithOffset, bf);
+    out.eff_int  = ei;
+    out.eff_fai  = ef;
+    out.base_int = bi;
+    out.base_fai = bf;
     return true;
 }
 
@@ -91,16 +58,19 @@ void dump_stat_block() {
         flog("[dump] stat block: no PlayerGameData (main menu?)");
         return;
     }
-    int s[8]{};
+    int b[8]{}, e[9]{};
     for (int k = 0; k < 8; ++k)
-        if (!mem::safe_read(pgd + kStatBlockOffset + k * 4, s[k])) {
-            flog("[dump] stat block: read fault at +0x%zX",
-                 kStatBlockOffset + static_cast<size_t>(k) * 4);
-            return;
-        }
-    flog("[dump] base stat block @PlayerGameData+0x3C: VIG=%d MND=%d END=%d "
-         "STR=%d DEX=%d INT=%d FAI=%d ARC=%d (before equipment bonuses)",
-         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
+        mem::safe_read(pgd + kBaseStatBlockOffset + k * 4, b[k]);
+    for (int k = 0; k < 9; ++k)
+        mem::safe_read(pgd + kEffStatBlockOffset + k * 4, e[k]);
+    unsigned char is_main = 0xFF;
+    mem::safe_read(pgd + kIsMainPlayerOffset, is_main);
+    flog("[dump] base stats  (+0x3C):  VIG=%d MND=%d END=%d STR=%d DEX=%d INT=%d FAI=%d ARC=%d",
+         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    flog("[dump] effective   (+0x288): VIG=%d MND=%d END=%d VIT=%d STR=%d DEX=%d INT=%d FAI=%d ARC=%d"
+         "  <- should match the status screen",
+         e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]);
+    flog("[dump] is_main_player(+0x8F0)=%u (expect 1)", is_main);
 }
 
 } // namespace omni

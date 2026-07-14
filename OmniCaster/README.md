@@ -76,9 +76,10 @@ the other across the three tables that produce that rating:
 
 Correction rows shared with non-catalyst weapons are detected and skipped
 (logged) so melee scaling can't be corrupted. `highest_stat` mode
-additionally reads your base INT/FAI from `PlayerGameData` and adds every
-stat bonus from your active effects (talismans, physick, buffs — they're all
-SpEffects), so the comparison uses your real effective stats.
+additionally reads your **effective** INT/FAI (the exact numbers the status
+screen shows, gear and buffs included) straight from the game's
+`PlayerGameData` — it keeps a pre-computed effective-stats block that the
+mod polls once a second.
 
 ## Overhaul mods (Convergence, Reforged, …)
 
